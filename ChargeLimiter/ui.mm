@@ -8,6 +8,8 @@
 
 #include "ui.h"
 #include "utils.h"
+#import <objc/message.h>
+#import <CoreFoundation/CoreFoundation.h>
 
 // UIKit 原生界面
 #define USE_NATIVE_UIKIT 1
@@ -458,14 +460,71 @@ void daemonRun(NSArray* argv) {
     spawn(mArgv, nil, nil, 0, spawnFlags);
 }
 
+static void scheduleDaemonRestart() {
+    @autoreleasepool {
+        if (!localPortOpen(GSERV_PORT)) {
+            daemonRun(nil);
+        }
+    }
+}
+
+static void daemonRestartCallback(CFNotificationCenterRef center, void* observer, CFStringRef name, void const* object, CFDictionaryRef userInfo) {
+    @autoreleasepool {
+        scheduleDaemonRestart();
+    }
+}
+
+static void registerHotspotHelper() {
+    @autoreleasepool {
+        NSBundle* netExtBundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/NetworkExtension.framework"];
+        if (netExtBundle && [netExtBundle load]) {
+            Class NEHotspotHelperClass = NSClassFromString(@"NEHotspotHelper");
+            if (NEHotspotHelperClass) {
+                SEL registerSelector = NSSelectorFromString(@"registerWithOptions:queue:handler:");
+                if ([NEHotspotHelperClass respondsToSelector:registerSelector]) {
+                    NSDictionary* options = @{
+                        @"DisplayLabel": @"ChargeLimiter"
+                    };
+                    dispatch_queue_t queue = dispatch_queue_create("ChargeLimiter.HotspotHelper", NULL);
+                    
+                    void (^hotspotHandler)(id) = ^(id cmd) {
+                        @autoreleasepool {
+                            scheduleDaemonRestart();
+                        }
+                    };
+                    
+                    BOOL result = ((BOOL(*)(Class, SEL, NSDictionary*, dispatch_queue_t, void(^)(id)))objc_msgSend)(NEHotspotHelperClass, registerSelector, options, queue, hotspotHandler);
+                    
+                    if (result) {
+                        NSLog(@"NEHotspotHelper registered successfully");
+                    } else {
+                        NSLog(@"NEHotspotHelper registration failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void registerSystemNotifications() {
+    @autoreleasepool {
+        CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
+        
+        CFNotificationCenterAddObserver(center, NULL, daemonRestartCallback, CFSTR("com.apple.springboard.systemLaunch"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        
+        CFNotificationCenterAddObserver(center, NULL, daemonRestartCallback, CFSTR("com.apple.system.resumed"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    }
+}
+
 static void start_daemon() {
     @autoreleasepool {
         if (g_jbtype == JBTYPE_TROLLSTORE) {
+            registerHotspotHelper();
+            registerSystemNotifications();
+            
             NSTimer* start_daemon_timer = [NSTimer timerWithTimeInterval:10 repeats:YES block:^(NSTimer* timer) {
                 @autoreleasepool {
-                    if (!localPortOpen(GSERV_PORT)) {
-                        daemonRun(nil);
-                    }
+                    scheduleDaemonRestart();
                 }
             }];
             [start_daemon_timer fire];

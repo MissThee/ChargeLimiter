@@ -1,7 +1,7 @@
 Package: com.chargelimiter.mod
 Name: Modified ChargeLimiter
-Version: 1.13.9.1
-Description: 优化了一下界面，trollstore模式注册自启
+Version: 1.14.0.1
+Description: trollstore模式注册自启
 Section: Applications
 Depends: firmware (>= 13.0)
 Priority: optional

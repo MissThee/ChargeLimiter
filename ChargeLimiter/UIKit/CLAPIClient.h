@@ -51,6 +51,18 @@ typedef void (^CLAPICallback)(NSDictionary *_Nullable response, NSError *_Nullab
 // 便捷方法 - 清空历史统计
 - (void)clearStatisticsWithCompletion:(nullable CLAPICallback)completion;
 
+// 便捷方法 - 运行停充控制探针（诊断用）
+- (void)runChargeControlProbeWithWaitMs:(NSInteger)waitMs
+                                restore:(BOOL)restore
+                             completion:(CLAPICallback)completion;
+
+// 便捷方法 - 运行停充控制探针（诊断用，可指定自定义 paths/services；nil 用 daemon 默认）
+- (void)runChargeControlProbeWithWaitMs:(NSInteger)waitMs
+                                restore:(BOOL)restore
+                                  paths:(nullable NSArray<NSString *> *)paths
+                               services:(nullable NSArray<NSString *> *)services
+                             completion:(CLAPICallback)completion;
+
 // 检查 daemon 是否存活
 - (void)checkDaemonAliveWithCompletion:(void (^)(BOOL alive))completion;
 

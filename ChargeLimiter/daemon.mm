@@ -145,6 +145,16 @@ static int g_holdAdaptiveAverageCurrentmA = 0;
 static time_t g_lastHoldRuntimeBehaviorChangeTs = 0;
 static NSMutableArray<NSNumber*>* g_holdCurrentSamples = nil;
 static BOOL g_predictiveInhibitFallbackActive = NO;
+static BOOL g_chargeControlProbeRunning = NO;
+static NSObject *g_probeLock = nil;
+
+static NSObject *CLProbeGetLock(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        g_probeLock = [[NSObject alloc] init];
+    });
+    return g_probeLock;
+}
 
 static const int kHoldDefaultMonitorIntervalMinutes = 3;
 static const int kHoldMinMonitorIntervalMinutes = 1;
@@ -217,6 +227,7 @@ static void cancelDisableInflowRetry(void);
 static void armDisableInflowRetryIfNeeded(NSDictionary* info, NSString* policyState, BOOL allowStart);
 static void syncSmartChargeCoordination(NSDictionary* info, BOOL isAdaptorConnected);
 static int getEffectiveBatteryCurrent(NSDictionary* info);
+static BOOL currentLooksCharging(int current);
 static void appendPolicyEventHistory(NSString* eventType, NSString* fromState, NSString* toState, NSString* reason, NSDictionary* info, NSDictionary* extras, time_t now);
 static void insertPolicyEventDBData(NSDictionary* event);
 static void migrateStoredPolicyEventsToDBIfNeeded(NSArray* history);
@@ -1088,11 +1099,111 @@ static void refreshTrollStoreBundleCheckTimer(void) {
 }
 
 
+// === iOS 17+ charge control override plane ============================
+// iOS 17 重构了停充控制面。真机探针 + IDA 结论：
+// - 读路径：AppleSmartBattery / IOPMPowerSource（发布 CurrentCapacity 等）
+// - 写路径 service：AppleSmartBattery（Manager 的 setProperties 返回 Unsupported）
+// - 可写 key：IsCharging (CH0C mode1) + PredictiveChargingInhibit (CH0B mode2)，极性相反
+// - 可写禁流 key：FieldDiagsInflowInhibit (CH0J) / OBCInflowInhibit (CH0I)
+// - ChargingOverride / InflowOverride 只是状态发布属性，当 setProperties key 会 BadArgument
+// - 旧 IsCharging-only / ExternalConnected 在部分路径上仍可能 write_noop
+static BOOL CLIsIOS17OrLater(void) {
+    // getSysVer 返回形如 "17.1" / "16.6" / ""
+    NSString* v = getSysVer() ?: @"";
+    NSArray* parts = [v componentsSeparatedByString:@"."];
+    NSInteger major = 0;
+    if (parts.count >= 1 && [parts[0] respondsToSelector:@selector(integerValue)]) {
+        major = [parts[0] integerValue];
+    }
+    return major >= 17;
+}
+
+static NSString* CLSmartBatteryManagerServiceName(void) {
+    return @"AppleSmartBatteryManager";
+}
+
+// iOS 17 setProperties 目标是 AppleSmartBattery（属性发布 nub），不是 Manager。
+// Manager 可匹配但：1) 不发布 CurrentCapacity 等读属性；2) setProperties 返回 kIOReturnUnsupported。
+static NSString* CLOverrideWriteServiceName(void) {
+    return @"AppleSmartBattery";
+}
+
+// 进程内缓存：首次 true 后不再重试匹配，避免每次写都做 IOServiceGetMatchingService。
+// 缓存失败不致命，调用方回退旧逻辑。
+static SInt8 g_overrideChargeControlCached = -1; // -1=未知, 0=否, 1=是
+
+static BOOL CLCanUseOverrideChargeControl(void) {
+    if (g_overrideChargeControlCached != -1) {
+        return g_overrideChargeControlCached == 1;
+    }
+    if (!CLIsIOS17OrLater()) {
+        g_overrideChargeControlCached = 0;
+        return NO;
+    }
+    // 以真正可写 setProperties 的 AppleSmartBattery 为准；Manager 仅作诊断探针目标。
+    io_service_t serv = IOServiceGetMatchingService(
+        kIOMasterPortDefault,
+        IOServiceMatching(CLOverrideWriteServiceName().UTF8String));
+    BOOL ok = (serv != IO_OBJECT_NULL);
+    if (ok) {
+        IOObjectRelease(serv);
+    }
+    g_overrideChargeControlCached = ok ? 1 : 0;
+    return ok;
+}
+
+// 复制一份 override 写 service；调用方必须 IOObjectRelease（与 getIOPMPSServ 缓存对象不同）。
+static io_service_t CLCopyOverrideWriteService(void) {
+    io_service_t serv = IOServiceGetMatchingService(
+        kIOMasterPortDefault,
+        IOServiceMatching(CLOverrideWriteServiceName().UTF8String));
+    if (serv != IO_OBJECT_NULL) {
+        return serv;
+    }
+    // 极端回退：个别环境只有 Manager 名可见
+    return IOServiceGetMatchingService(
+        kIOMasterPortDefault,
+        IOServiceMatching(CLSmartBatteryManagerServiceName().UTF8String));
+}
+
+// iOS 17 停充：可写入口是 IsCharging (mode1/CH0C) + PredictiveChargingInhibit (mode2/CH0B)。
+// ChargingOverride 只是状态发布属性，当 setProperties key 会返回 kIOReturnBadArgument
+// （真机 2026-08-02 探针：ChargingOverride → -536870206，PCI 单独写 → 0）。
+// 极性相反：停充 = IsCharging=NO + PredictiveChargingInhibit=YES；
+//           恢复 = IsCharging=YES + PredictiveChargingInhibit=NO。
+static kern_return_t writeChargeStatusOverride(io_service_t serv, BOOL stop) {
+    if (serv == IO_OBJECT_NULL) {
+        return KERN_INVALID_ARGUMENT;
+    }
+    NSMutableDictionary* props = [NSMutableDictionary dictionary];
+    props[@"IsCharging"] = @(stop ? NO : YES);
+    props[@"PredictiveChargingInhibit"] = @(stop ? YES : NO);
+    return IORegistryEntrySetCFProperties(serv, (__bridge CFTypeRef)props);
+}
+
+// iOS 17 禁流：可写入口是 FieldDiagsInflowInhibit（mode2/CH0J）+ OBCInflowInhibit（mode1/CH0I 备用）。
+// InflowOverride 只是状态发布属性，当 setProperties key 会 BadArgument。
+// flag=YES → 允许流入（inhibit=NO）；flag=NO → 禁流（inhibit=YES）。
+static kern_return_t setInflowStatusOverride(io_service_t serv, BOOL flag) {
+    if (serv == IO_OBJECT_NULL) {
+        return KERN_INVALID_ARGUMENT;
+    }
+    NSNumber* inhibit = @(flag ? NO : YES);
+    NSMutableDictionary* props = [NSMutableDictionary dictionary];
+    props[@"FieldDiagsInflowInhibit"] = inhibit;
+    props[@"OBCInflowInhibit"] = inhibit;
+    return IORegistryEntrySetCFProperties(serv, (__bridge CFTypeRef)props);
+}
+
 static io_service_t getIOPMPSServ() {
     static io_service_t serv = IO_OBJECT_NULL;
     if (serv == IO_OBJECT_NULL) {
-        BOOL adv_prefer_smart = getLocalBool(@"adv_prefer_smart", NO);
-        if (adv_prefer_smart) {
+        // 读路径必须用发布电池属性的 service（AppleSmartBattery / IOPMPowerSource）。
+        // 切勿匹配 AppleSmartBatteryManager：它不发布 CurrentCapacity/Amperage，
+        // 会导致 UI 电量全 0（真机 2026-08-02 探针已证实）。
+        // iOS 17+ 默认优先 AppleSmartBattery（override 写目标与属性面一致）。
+        BOOL try_smart = getLocalBool(@"adv_prefer_smart", NO) || CLIsIOS17OrLater();
+        if (try_smart) {
             serv = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AppleSmartBattery")); // >=iPhone8
         }
         if (serv != IO_OBJECT_NULL) {
@@ -1111,7 +1222,7 @@ static NSDictionary* getBatSlimInfo(NSDictionary* info) {
     NSMutableDictionary* filtered_info = [NSMutableDictionary dictionary];
     NSArray* keep = @[
         @"Amperage", @"AppleRawCurrentCapacity", @"BatteryInstalled", @"BootVoltage", @"CurrentCapacity", @"CycleCount", @"DesignCapacity", @"ExternalChargeCapable", @"ExternalConnected",
-        @"InstantAmperage", @"IsCharging", @"NominalChargeCapacity", @"PostChargeWaitSeconds", @"PostDischargeWaitSeconds", @"PredictiveChargingInhibit", @"Serial", @"Temperature",
+        @"InstantAmperage", @"IsCharging", @"ChargingOverride", @"NotChargingReason", @"NominalChargeCapacity", @"PostChargeWaitSeconds", @"PostDischargeWaitSeconds", @"PredictiveChargingInhibit", @"Serial", @"Temperature",
         @"UpdateTime", @"VirtualTemperature", @"Voltage"];
     for (NSString* key in info) {
         if ([keep containsObject:key]) {
@@ -1173,6 +1284,31 @@ static int getBatInfo(NSDictionary* __strong* pinfo, BOOL slim=YES) {
 }
 
 static int setInflowStatus(BOOL flag) {
+    if (g_chargeControlProbeRunning) {
+        return 0; // 探针期间忽略自动写
+    }
+    // iOS 17+: 禁流写到 AppleSmartBattery 的 FieldDiagsInflowInhibit/OBCInflowInhibit。
+    // InflowOverride 是发布属性，不能当 setProperties key（会 BadArgument）。
+    if (CLCanUseOverrideChargeControl()) {
+        io_service_t overrideServ = CLCopyOverrideWriteService();
+        if (overrideServ != IO_OBJECT_NULL) {
+            kern_return_t ret = setInflowStatusOverride(overrideServ, flag);
+            IOObjectRelease(overrideServ);
+            if (ret == 0) {
+                g_lastInflowCommandTs = time(0);
+                return 0;
+            }
+            NSFileErrorLog(@"override inflow write failed ret=%d flag=%d, fallback to legacy ExternalConnected", ret, flag);
+            appendPolicyEventHistory(@"charge_path_event",
+                                     g_policyState ?: @"",
+                                     g_policyState ?: @"",
+                                     @"override_inflow_write_failed",
+                                     bat_info,
+                                     @{ @"inflow_flag": @(flag), @"io_return": @(ret) },
+                                     time(0));
+            // 落到下方旧 ExternalConnected 逻辑
+        }
+    }
     io_service_t serv = getIOPMPSServ();
     if (serv == IO_OBJECT_NULL) {
         return -1;
@@ -1241,6 +1377,345 @@ static kern_return_t writeChargeStatus(io_service_t serv, BOOL flag, BOOL usePre
     return IORegistryEntrySetCFProperties(serv, (__bridge CFTypeRef)props);
 }
 
+// Charge control probe helpers (diagnostic-only; user-triggered)
+static NSArray* CLProbeDefaultPaths(void) {
+    return @[
+        @"is_charging_only",
+        @"legacy_is_charging",
+        @"charging_override",
+        @"predictive_inhibit_override",
+        @"inflow_override",
+        @"predictive_inhibit",
+        @"external_connected_off",
+    ];
+}
+static NSArray* CLProbeDefaultServices(void) {
+    // auto = 读路径 service（AppleSmartBattery / IOPMPowerSource）。
+    // 写面探针显式测 AppleSmartBattery（override setProperties 目标）与 Manager（对照）。
+    return @[@"auto", @"AppleSmartBattery", @"AppleSmartBatteryManager", @"IOPMPowerSource"];
+}
+
+static NSString* CLProbeVerdictForResult(kern_return_t writeRet,
+                                         BOOL propChanged,
+                                         BOOL currentStopped,
+                                         BOOL serviceMissing) {
+    if (serviceMissing) {
+        return @"service_missing";
+    }
+    if (writeRet != KERN_SUCCESS) {
+        return @"write_rejected";
+    }
+    // iOS17: hardware may drop current / flip ChargingOverride bitmask without
+    // flipping the classic IsCharging bool. Treat current stop as effective even
+    // when classic prop_changed is false (deep probe 2026-08-02).
+    if (currentStopped) {
+        return @"effective";
+    }
+    if (propChanged && !currentStopped) {
+        return @"prop_only";
+    }
+    return @"write_noop";
+}
+
+static BOOL CLProbePropChangedForPath(NSString* path,
+                                      NSDictionary* before,
+                                      NSDictionary* after) {
+    NSDictionary* safeBefore = before ?: @{};
+    NSDictionary* safeAfter = after ?: @{};
+    if ([path isEqualToString:@"is_charging_only"] ||
+        [path isEqualToString:@"legacy_is_charging"] ||
+        [path isEqualToString:@"charging_override"]) {
+        // iOS17: hardware may drop current / flip ChargingOverride bitmask while
+        // classic IsCharging stays true. Count any of:
+        //  - IsCharging true→false
+        //  - PCI false→true
+        //  - ChargingOverride integer change
+        //  - current looks-charging → not
+        BOOL afterCharging = [safeAfter[@"IsCharging"] boolValue];
+        BOOL afterInhibit = [safeAfter[@"PredictiveChargingInhibit"] boolValue];
+        BOOL beforeCharging = [safeBefore[@"IsCharging"] boolValue];
+        BOOL beforeInhibit = [safeBefore[@"PredictiveChargingInhibit"] boolValue];
+        if ((!afterCharging && beforeCharging) || (afterInhibit && !beforeInhibit)) {
+            return YES;
+        }
+        id beforeCOObj = safeBefore[@"ChargingOverride"];
+        id afterCOObj = safeAfter[@"ChargingOverride"];
+        NSInteger beforeCO = 0;
+        NSInteger afterCO = 0;
+        if (beforeCOObj != nil && beforeCOObj != [NSNull null] &&
+            [beforeCOObj respondsToSelector:@selector(integerValue)]) {
+            beforeCO = [beforeCOObj integerValue];
+        }
+        if (afterCOObj != nil && afterCOObj != [NSNull null] &&
+            [afterCOObj respondsToSelector:@selector(integerValue)]) {
+            afterCO = [afterCOObj integerValue];
+        }
+        if (afterCO != beforeCO) {
+            return YES;
+        }
+        int beforeCur = getEffectiveBatteryCurrent(safeBefore);
+        int afterCur = getEffectiveBatteryCurrent(safeAfter);
+        if (currentLooksCharging(beforeCur) && !currentLooksCharging(afterCur)) {
+            return YES;
+        }
+        return NO;
+    }
+    if ([path isEqualToString:@"predictive_inhibit"] ||
+        [path isEqualToString:@"predictive_inhibit_override"]) {
+        if ([safeAfter[@"PredictiveChargingInhibit"] boolValue] &&
+            ![safeBefore[@"PredictiveChargingInhibit"] boolValue]) {
+            return YES;
+        }
+        id beforeCOObj = safeBefore[@"ChargingOverride"];
+        id afterCOObj = safeAfter[@"ChargingOverride"];
+        NSInteger beforeCO = 0;
+        NSInteger afterCO = 0;
+        if (beforeCOObj != nil && beforeCOObj != [NSNull null] &&
+            [beforeCOObj respondsToSelector:@selector(integerValue)]) {
+            beforeCO = [beforeCOObj integerValue];
+        }
+        if (afterCOObj != nil && afterCOObj != [NSNull null] &&
+            [afterCOObj respondsToSelector:@selector(integerValue)]) {
+            afterCO = [afterCOObj integerValue];
+        }
+        return afterCO != beforeCO;
+    }
+    if ([path isEqualToString:@"external_connected_off"]) {
+        return ![safeAfter[@"ExternalConnected"] boolValue] &&
+               [safeBefore[@"ExternalConnected"] boolValue];
+    }
+    if ([path isEqualToString:@"inflow_override"]) {
+        int beforeCur = getEffectiveBatteryCurrent(safeBefore);
+        int afterCur = getEffectiveBatteryCurrent(safeAfter);
+        return currentLooksCharging(beforeCur) && !currentLooksCharging(afterCur);
+    }
+    return NO;
+}
+
+static NSDictionary* CLProbeSummarizeResults(NSArray* results, BOOL hasExternalPower) {
+    BOOL anyEffective = NO;
+    NSString* bestPath = nil;
+    NSMutableDictionary* failCounts = [NSMutableDictionary dictionary];
+    for (NSDictionary* item in results ?: @[]) {
+        NSString* verdict = [item[@"verdict"] description] ?: @"write_noop";
+        if ([verdict isEqualToString:@"effective"]) {
+            anyEffective = YES;
+            if (bestPath == nil) {
+                NSString* service = [item[@"service"] description] ?: @"";
+                NSString* path = [item[@"path"] description] ?: @"";
+                bestPath = [NSString stringWithFormat:@"%@|%@", service, path];
+            }
+            continue;
+        }
+        NSNumber* count = failCounts[verdict] ?: @0;
+        failCounts[verdict] = @(count.integerValue + 1);
+    }
+    NSString* dominantFailure = @"none";
+    NSInteger bestCount = -1;
+    for (NSString* key in failCounts) {
+        NSInteger c = [failCounts[key] integerValue];
+        if (c > bestCount) {
+            bestCount = c;
+            dominantFailure = key;
+        }
+    }
+    NSMutableDictionary* summary = [@{
+        @"any_effective": @(anyEffective),
+        @"best_path": bestPath ?: [NSNull null],
+        @"dominant_failure": dominantFailure,
+    } mutableCopy];
+    if (!hasExternalPower) {
+        summary[@"power_note"] = @"no_external_power";
+    }
+    return summary;
+}
+
+static io_service_t CLProbeCopyServiceNamed(NSString* serviceName) {
+    if ([serviceName isEqualToString:@"auto"]) {
+        io_service_t serv = getIOPMPSServ();
+        if (serv != IO_OBJECT_NULL) {
+            // getIOPMPSServ 返回缓存对象，调用方不要 IOObjectRelease
+            return serv;
+        }
+        return IO_OBJECT_NULL;
+    }
+    if (serviceName.length == 0) {
+        return IO_OBJECT_NULL;
+    }
+    return IOServiceGetMatchingService(kIOMasterPortDefault,
+                                       IOServiceMatching(serviceName.UTF8String));
+}
+
+static BOOL CLProbeServiceNeedsRelease(NSString* serviceName) {
+    return ![serviceName isEqualToString:@"auto"];
+}
+
+static NSString* CLProbeResolvedServiceName(NSString* requested, io_service_t serv) {
+    if (serv == IO_OBJECT_NULL) {
+        return requested ?: @"";
+    }
+    if ([requested isEqualToString:@"auto"]) {
+        // auto 永远解析为读路径实际 service（getIOPMPSServ 结果），不伪装成 Manager。
+        return g_use_smart ? @"AppleSmartBattery" : @"IOPMPowerSource";
+    }
+    return requested ?: @"";
+}
+
+static NSDictionary* CLProbeSnapshotFromInfo(NSDictionary* info) {
+    NSDictionary* safe = info ?: @{};
+    return @{
+        @"IsCharging": @([safe[@"IsCharging"] boolValue]),
+        @"ChargingOverride": safe[@"ChargingOverride"] ?: [NSNull null],
+        @"NotChargingReason": safe[@"NotChargingReason"] ?: [NSNull null],
+        @"PredictiveChargingInhibit": @([safe[@"PredictiveChargingInhibit"] boolValue]),
+        @"ExternalConnected": @([safe[@"ExternalConnected"] boolValue]),
+        @"ExternalChargeCapable": @([safe[@"ExternalChargeCapable"] boolValue]),
+        @"CurrentCapacity": @([safe[@"CurrentCapacity"] intValue]),
+        @"InstantAmperage": @(getEffectiveBatteryCurrent(safe)),
+        @"Amperage": @([safe[@"Amperage"] intValue]),
+        @"AdapterDetails": safe[@"AdapterDetails"] ?: [NSNull null],
+    };
+}
+
+static kern_return_t CLProbeWritePath(io_service_t serv, NSString* path, BOOL stop) {
+    NSMutableDictionary* props = [NSMutableDictionary dictionary];
+    if ([path isEqualToString:@"is_charging_only"]) {
+        // Single-key write: only IsCharging. Isolates whether PCI co-write blocks effect.
+        props[@"IsCharging"] = @(stop ? NO : YES);
+    } else if ([path isEqualToString:@"legacy_is_charging"]) {
+        props[@"IsCharging"] = @(stop ? NO : YES);
+        props[@"PredictiveChargingInhibit"] = @NO;
+    } else if ([path isEqualToString:@"predictive_inhibit"]) {
+        props[@"IsCharging"] = @YES;
+        props[@"PredictiveChargingInhibit"] = @(stop ? YES : NO);
+    } else if ([path isEqualToString:@"external_connected_off"]) {
+        props[@"ExternalConnected"] = @(stop ? NO : YES);
+    } else if ([path isEqualToString:@"charging_override"]) {
+        // iOS 17 可写停充：IsCharging + PredictiveChargingInhibit 极性相反。
+        // stop=YES → IsCharging=NO, PCI=YES；stop=NO → IsCharging=YES, PCI=NO。
+        // 不要写 ChargingOverride（发布属性，会 BadArgument）。
+        props[@"IsCharging"] = @(stop ? NO : YES);
+        props[@"PredictiveChargingInhibit"] = @(stop ? YES : NO);
+    } else if ([path isEqualToString:@"predictive_inhibit_override"]) {
+        // 单独写 PredictiveChargingInhibit（mode2），用于隔离变量。
+        props[@"PredictiveChargingInhibit"] = @(stop ? YES : NO);
+    } else if ([path isEqualToString:@"inflow_override"]) {
+        // iOS 17 可写禁流：FieldDiagsInflowInhibit / OBCInflowInhibit。
+        // stop=YES → inhibit YES；stop=NO → inhibit NO。
+        NSNumber* inhibit = @(stop ? YES : NO);
+        props[@"FieldDiagsInflowInhibit"] = inhibit;
+        props[@"OBCInflowInhibit"] = inhibit;
+    } else {
+        return KERN_INVALID_ARGUMENT;
+    }
+    return IORegistryEntrySetCFProperties(serv, (__bridge CFTypeRef)props);
+}
+
+static NSDictionary* CLProbeRunOne(NSString* serviceName, NSString* path, NSInteger waitMs, BOOL restore) {
+    NSString* requestedName = serviceName ?: @"";
+    NSString* safePath = path ?: @"";
+    io_service_t serv = CLProbeCopyServiceNamed(requestedName);
+    NSString* resolvedName = CLProbeResolvedServiceName(requestedName, serv);
+    BOOL needsRelease = CLProbeServiceNeedsRelease(requestedName);
+
+    if (serv == IO_OBJECT_NULL) {
+        NSDictionary* emptySnap = CLProbeSnapshotFromInfo(@{});
+        return @{
+            @"service": resolvedName,
+            @"requested_service": requestedName,
+            @"path": safePath,
+            @"write_ret": @(KERN_FAILURE),
+            @"before": emptySnap,
+            @"after": emptySnap,
+            @"restored": [NSNull null],
+            @"prop_changed": @NO,
+            @"current_stopped": @NO,
+            @"verdict": @"service_missing",
+        };
+    }
+
+    NSDictionary* beforeInfo = nil;
+    getBatInfoWithServ(serv, &beforeInfo);
+    NSDictionary* beforeSnap = CLProbeSnapshotFromInfo(beforeInfo);
+
+    kern_return_t writeRet = CLProbeWritePath(serv, safePath, YES);
+    if (waitMs > 0) {
+        usleep((useconds_t)(waitMs * 1000));
+    }
+
+    NSDictionary* afterInfo = nil;
+    getBatInfoWithServ(serv, &afterInfo);
+    NSDictionary* afterSnap = CLProbeSnapshotFromInfo(afterInfo);
+
+    id restoredSnap = [NSNull null];
+    BOOL didRestore = NO;
+    kern_return_t restoreRet = KERN_SUCCESS;
+    if (restore) {
+        didRestore = YES;
+        restoreRet = CLProbeWritePath(serv, safePath, NO);
+        // iOS17: also clear hardware inhibit bitmask if still set after path restore.
+        // Deep probe saw ChargingOverride stick at 1/2/3 after stop writes.
+        NSMutableDictionary* clearProps = [NSMutableDictionary dictionary];
+        clearProps[@"IsCharging"] = @YES;
+        clearProps[@"PredictiveChargingInhibit"] = @NO;
+        kern_return_t clearRet = IORegistryEntrySetCFProperties(serv, (__bridge CFTypeRef)clearProps);
+        if (restoreRet == KERN_SUCCESS && clearRet != KERN_SUCCESS) {
+            restoreRet = clearRet;
+        }
+        NSDictionary* restoredInfo = nil;
+        getBatInfoWithServ(serv, &restoredInfo);
+        restoredSnap = CLProbeSnapshotFromInfo(restoredInfo);
+    }
+
+    if (needsRelease && serv != IO_OBJECT_NULL) {
+        IOObjectRelease(serv);
+    }
+
+    BOOL propChanged = CLProbePropChangedForPath(safePath, beforeSnap, afterSnap);
+    int beforeCurrent = getEffectiveBatteryCurrent(beforeInfo ?: @{});
+    int afterCurrent = getEffectiveBatteryCurrent(afterInfo ?: @{});
+    BOOL beforeLooks = currentLooksCharging(beforeCurrent);
+    BOOL afterLooks = currentLooksCharging(afterCurrent);
+    BOOL currentStopped = NO;
+    BOOL baselineNotCharging = NO;
+    if (!beforeLooks) {
+        // before 本就不像充电：不把 current_stopped 算作有效停充证据（需真实 transition）
+        baselineNotCharging = YES;
+        currentStopped = NO;
+    } else {
+        currentStopped = !afterLooks && beforeLooks;
+    }
+
+    NSString* verdict = CLProbeVerdictForResult(writeRet, propChanged, currentStopped, NO);
+    // Only mask with restore_failed when STOP write itself succeeded.
+    // If stop write already failed, keep write_rejected (or other stop verdict).
+    if (didRestore && writeRet == KERN_SUCCESS && restoreRet != KERN_SUCCESS) {
+        verdict = @"restore_failed";
+    }
+
+    NSMutableDictionary* result = [@{
+        @"service": resolvedName,
+        @"requested_service": requestedName,
+        @"path": safePath,
+        @"write_ret": @(writeRet),
+        @"before": beforeSnap,
+        @"after": afterSnap,
+        @"restored": restoredSnap,
+        @"prop_changed": @(propChanged),
+        @"current_stopped": @(currentStopped),
+        @"before_current": @(beforeCurrent),
+        @"after_current": @(afterCurrent),
+        @"verdict": verdict,
+    } mutableCopy];
+    if (didRestore) {
+        result[@"restore_ret"] = @(restoreRet);
+    }
+    if (baselineNotCharging) {
+        result[@"current_baseline_not_charging"] = @YES;
+    }
+    return result;
+}
+
 static void markPredictiveInhibitFallbackActive(NSString* reason, NSDictionary* info, NSDictionary* extras, time_t now) {
     if (g_predictiveInhibitFallbackActive) {
         return;
@@ -1273,6 +1748,38 @@ static BOOL shouldFallbackFromPredictiveInhibitStop(BOOL isAdaptorConnected,
 }
 
 static int setChargeStatus(BOOL flag) {
+    if (g_chargeControlProbeRunning) {
+        return 0; // 探针期间忽略自动/手动写
+    }
+    // iOS 17+: 写到 AppleSmartBattery 的 IsCharging+PredictiveChargingInhibit（极性相反）。
+    // ChargingOverride 是发布属性，不能当 setProperties key（真机 BadArgument）。
+    // Manager setProperties 返回 kIOReturnUnsupported。
+    if (CLCanUseOverrideChargeControl()) {
+        io_service_t overrideServ = CLCopyOverrideWriteService();
+        if (overrideServ != IO_OBJECT_NULL) {
+            // flag = charge-enabled; override helper takes stop = !chargeEnabled
+            kern_return_t ret = writeChargeStatusOverride(overrideServ, !flag);
+            IOObjectRelease(overrideServ);
+            if (ret == 0) {
+                g_chargeCommandEnabled = flag;
+                g_lastChargeCommandTs = time(0);
+                return 0;
+            }
+            // override 写失败：记事件后回退旧逻辑，不直接失败。
+            NSDictionary* extras = @{
+                @"charge_flag": @(flag),
+                @"fallback_reason": @"override_write_failed",
+                @"io_return": @(ret),
+            };
+            NSFileErrorLog(@"override charge write failed ret=%d flag=%d, fallback to legacy path", ret, flag);
+            appendPolicyEventHistory(@"charge_path_event",
+                                     g_policyState ?: @"",
+                                     g_policyState ?: @"",
+                                     @"override_charge_write_failed",
+                                     bat_info, extras, time(0));
+            // 落到下方旧逻辑
+        }
+    }
     io_service_t serv = getIOPMPSServ();
     if (serv == IO_OBJECT_NULL) {
         return -1;
@@ -1327,6 +1834,9 @@ static void syncThermalSimulationModeForCurrentState(NSDictionary* info) {
 }
 
 static int setBatteryStatus(BOOL flag) {
+    if (g_chargeControlProbeRunning) {
+        return 0; // 探针期间忽略自动写
+    }
     int ret = setChargeStatus(flag);
     syncThermalSimulationModeForCurrentState(bat_info);
     return ret;
@@ -3116,6 +3626,95 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
         return @{
             @"status": @(status)
         };
+    } else if ([api isEqualToString:@"charge_control_probe"]) {
+        @synchronized (CLProbeGetLock()) {
+            if (g_chargeControlProbeRunning) {
+                return @{ @"status": @-12, @"msg": @"probe_busy" };
+            }
+            g_chargeControlProbeRunning = YES;
+        }
+        NSDictionary* response = nil;
+        @try {
+            // Deep probe default 2000ms: give hardware time to react after prop-only writes.
+            // Matrix is larger now; total time can exceed 5s — acceptable for diagnostic.
+            NSInteger waitMs = 2000;
+            if (nsreq[@"wait_ms"] != nil && [nsreq[@"wait_ms"] respondsToSelector:@selector(integerValue)]) {
+                waitMs = [nsreq[@"wait_ms"] integerValue];
+            }
+            if (waitMs < 200) waitMs = 200;
+            if (waitMs > 2000) waitMs = 2000;
+            BOOL restore = YES;
+            if (nsreq[@"restore"] != nil) {
+                restore = [nsreq[@"restore"] boolValue];
+            }
+            NSArray* paths = nsreq[@"paths"];
+            if (![paths isKindOfClass:[NSArray class]] || paths.count == 0) {
+                paths = CLProbeDefaultPaths();
+            }
+            NSArray* services = nsreq[@"services"];
+            if (![services isKindOfClass:[NSArray class]] || services.count == 0) {
+                services = CLProbeDefaultServices();
+            }
+
+            // Refresh bat_info once so external-power note / history extras are current.
+            getBatInfo(&bat_info);
+            NSMutableArray* results = [NSMutableArray array];
+            BOOL hasExternalPower = hasPotentialExternalPowerSignal(bat_info);
+            // Skip services that resolve to an underlying name already probed (e.g. auto == AppleSmartBattery).
+            NSMutableSet* probedResolvedServices = [NSMutableSet set];
+            for (id serviceObj in services) {
+                NSString* serviceName = [serviceObj isKindOfClass:[NSString class]] ? (NSString*)serviceObj : [serviceObj description];
+                // auto 解析必须与 CLProbeResolvedServiceName 一致，避免把 auto 错记成 Manager
+                // 从而跳过真正的 AppleSmartBattery 探针（真机 2026-08-02 复现）。
+                NSString* resolvedPeek = [serviceName isEqualToString:@"auto"]
+                    ? (g_use_smart ? @"AppleSmartBattery" : @"IOPMPowerSource")
+                    : (serviceName ?: @"");
+                if (resolvedPeek.length > 0 && [probedResolvedServices containsObject:resolvedPeek]) {
+                    continue;
+                }
+                if (resolvedPeek.length > 0) {
+                    [probedResolvedServices addObject:resolvedPeek];
+                }
+                for (id pathObj in paths) {
+                    NSString* path = [pathObj isKindOfClass:[NSString class]] ? (NSString*)pathObj : [pathObj description];
+                    NSDictionary* one = CLProbeRunOne(serviceName, path, waitMs, restore);
+                    if (one != nil) {
+                        [results addObject:one];
+                    }
+                }
+            }
+
+            NSDictionary* summary = CLProbeSummarizeResults(results, hasExternalPower);
+            appendPolicyEventHistory(@"charge_path_event",
+                                     g_policyState ?: @"",
+                                     g_policyState ?: @"",
+                                     @"charge_control_probe",
+                                     bat_info,
+                                     @{ @"summary": summary, @"result_count": @(results.count) },
+                                     time(0));
+
+            response = @{
+                @"status": @0,
+                @"data": @{
+                    @"device": getDevMdoel() ?: @"",
+                    @"sysver": getSysVer() ?: @"",
+                    @"jb_type": @(getJBType()),
+                    @"use_smart": @(g_use_smart),
+                    @"probe_ts": @(time(0)),
+                    @"wait_ms": @(waitMs),
+                    @"restore": @(restore),
+                    @"results": results,
+                    @"summary": summary,
+                },
+            };
+        } @finally {
+            @synchronized (CLProbeGetLock()) {
+                g_chargeControlProbeRunning = NO;
+            }
+        }
+        // 探针结束后拉回正常策略（必须在互斥释放后，否则 setBatteryStatus/setInflowStatus 会被短路）
+        refreshBatteryStateAndApplyPolicy();
+        return response ?: @{ @"status": @-11, @"msg": @"probe_failed" };
     }
     return @{
         @"status": @-10

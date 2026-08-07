@@ -9,7 +9,11 @@
 #import "../CLBatteryManager.h"
 #import "../CLAPIClient.h"
 #import "../CLSymbolImageSupport.h"
+#import "../CLAppSettingsStore.h"
 #import "../../CLLocalization.h"
+// 写失败通知在 utils.mm 中定义/广播，这里前向声明即可拿到符号，
+// 避免把整个 utils.h 拖进来（utils.h 含大量 daemon 侧声明，不适配 UIKit target）。
+extern NSString* const CLConfigWriteFailedNotification;
 NSUserDefaults* getAppUserDefaults(void);
 NSString* getAppDocumentsPath_C(void);
 NSString* getConfPath_C(void);
@@ -4000,7 +4004,8 @@ static UIViewController *CLTopVisibleViewController(void) {
 
     self.statusLabel.text = statusText ?: @"";
     self.percentage = manager.currentCapacity;
-    self.isCharging = manager.isCharging;
+    // 与 CLManagerLooksChargingForDisplay 对齐：iOS17 sticky IsCharging 不能驱动 UI 充电态
+    self.isCharging = CLManagerLooksChargingForDisplay(manager);
 
     CLBatteryVisualState nextState = [self visualStateForManager:manager];
     BOOL stateChanged = (nextState != (CLBatteryVisualState)self.visualState);
@@ -4300,19 +4305,21 @@ static NSString *CLDaemonLanguageValueForLocaleIdentifier(NSString *identifier) 
 
 static NSString * const CLStopChargePresetDefaultsKey = @"StopChargePresetValue";
 
-// 通过 CLSettingsStore 读写设置项，确保在 roothide 环境下配置随 jbroot 路径持久化，
-// 重启/重新越狱后不会丢失。NSUserDefaults standardUserDefaults 在 roothide 下写入裸
-// rootfs 路径，无法持久化，因此这些设置统一改走 local KV。
+// App 专属设置统一走 CLAppSettingsStore（NSUserDefaults suite com.chargelimiter.mod.appdata），
+// 与 root daemon 的共享 plist 物理隔离；roothide 下 mobile 进程可读写，重启/重新越狱后不丢失。
+// 写失败时发送 CLConfigWriteFailedNotification，由 AppDelegate 弹出失败提示并去重。
 static NSInteger CLLocalIntegerForKey(NSString *key, NSInteger defaultValue) {
-    id raw = getlocalKV_C(key);
-    if ([raw isKindOfClass:[NSNumber class]]) {
-        return [(NSNumber *)raw integerValue];
-    }
-    return defaultValue;
+    return [[CLAppSettingsStore shared] integerForKey:key defaultValue:defaultValue];
 }
 
 static void CLSetLocalIntegerForKey(NSString *key, NSInteger value) {
-    setlocalKV_C(key, @(value));
+    NSError *error = nil;
+    if (![[CLAppSettingsStore shared] setIntegerForKey:key value:value error:&error]) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:CLConfigWriteFailedNotification
+                                                            object:nil
+                                                          userInfo:@{@"key": key,
+                                                                     @"error": error ?: [NSNull null]}];
+    }
 }
 
 static NSInteger CLNormalizedStopChargePresetValue(NSInteger value) {
@@ -4612,17 +4619,26 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:CLL(@"语言") message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     CLAppLanguage current = CLGetAppLanguage();
 
+    void (^applyLanguage)(CLAppLanguage) = ^(CLAppLanguage language) {
+        NSError *error = nil;
+        if (CLSetAppLanguage(language, &error)) {
+            [self syncDaemonLanguageWithAppLanguage:language];
+        } else {
+            [[NSNotificationCenter defaultCenter] postNotificationName:CLConfigWriteFailedNotification
+                                                                object:nil
+                                                              userInfo:@{@"key": @"AppLanguage",
+                                                                         @"error": error ?: [NSNull null]}];
+        }
+    };
+
     [alert addAction:[self checkedActionWithTitle:CLL(@"跟随系统") checked:(current == CLAppLanguageSystem) handler:^(UIAlertAction * _Nonnull action) {
-        CLSetAppLanguage(CLAppLanguageSystem);
-        [self syncDaemonLanguageWithAppLanguage:CLAppLanguageSystem];
+        applyLanguage(CLAppLanguageSystem);
     }]];
     [alert addAction:[self checkedActionWithTitle:CLL(@"English") checked:(current == CLAppLanguageEnglish) handler:^(UIAlertAction * _Nonnull action) {
-        CLSetAppLanguage(CLAppLanguageEnglish);
-        [self syncDaemonLanguageWithAppLanguage:CLAppLanguageEnglish];
+        applyLanguage(CLAppLanguageEnglish);
     }]];
     [alert addAction:[self checkedActionWithTitle:CLL(@"简体中文") checked:(current == CLAppLanguageChineseSimplified) handler:^(UIAlertAction * _Nonnull action) {
-        CLSetAppLanguage(CLAppLanguageChineseSimplified);
-        [self syncDaemonLanguageWithAppLanguage:CLAppLanguageChineseSimplified];
+        applyLanguage(CLAppLanguageChineseSimplified);
     }]];
     
     [alert addAction:[UIAlertAction actionWithTitle:CLL(@"取消") style:UIAlertActionStyleCancel handler:nil]];
@@ -6353,8 +6369,30 @@ static BOOL CLManagerLooksChargingForDisplay(CLBatteryManager *manager) {
     if (!manager) {
         return NO;
     }
+    // iOS 17 上有效停充后 IsCharging 常保持 true（电流已 < 阈值）。
+    // 显示层必须以电流 + daemon 命令/策略为准，不能单信系统 IsCharging。
     NSInteger current = CLEffectiveBatteryCurrentForManager(manager);
-    return manager.isCharging || manager.holdCharging || current > CLDisplayChargingThresholdmA;
+    if (current > CLDisplayChargingThresholdmA) {
+        return YES;
+    }
+    if (manager.holdCharging) {
+        return YES;
+    }
+    // 仅在 daemon 仍允许充电、且不在停充/保持策略时，才信 IsCharging。
+    if (!manager.isCharging || !manager.chargeCommandEnabled) {
+        return NO;
+    }
+    if (manager.holdActive || manager.predictiveChargingInhibitActive) {
+        return NO;
+    }
+    NSString *policyState = [manager.policyState isKindOfClass:[NSString class]] ? manager.policyState : @"";
+    if ([policyState isEqualToString:@"hold"]
+        || [policyState isEqualToString:@"stopped"]
+        || [policyState isEqualToString:@"temp_paused"]
+        || [policyState isEqualToString:@"no_inflow"]) {
+        return NO;
+    }
+    return YES;
 }
 
 static BOOL CLManagerLooksDischargingForDisplay(CLBatteryManager *manager) {

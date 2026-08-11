@@ -1,10 +1,14 @@
 #include "utils.h"
 #import "CLLocalization.h"
+#include <errno.h>
 #include <limits.h>
+#include <pwd.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <sys/utsname.h>
 #include <sys/sysctl.h>
 #include <notify.h>
+#include "CLFileLogPolicy.h"
 #import <objc/message.h>
 
 // REFACTOR: 使用标准 libroot API 而不是手动实现
@@ -18,10 +22,13 @@ static NSString* g_confPath = nil;
 static NSString* g_dbPath = nil;
 static NSString* g_appDocumentsPathOverride = nil;
 static NSString* g_runtimeDataRootPath = nil;
+static NSString* g_pathResolutionSource = @"uninitialized";
+static NSDictionary* g_lastConfigWriteDiagnostics = nil;
 static NSString* const kLegacyContainerCacheFileName = @"com.chargelimiter.mod.containerpath";
 static NSString* const kRoothideDataRoot = @"/var/mobile/ChargeLimiter";
 static NSString* const kRoothideLegacySharedDataRoot = @"/var/mobile/Library/Application Support/ChargeLimiter";
 typedef const char* (*jbroot_fn_t)(const char* path);
+static CLFileLogMode g_fileLogMode = CLFileLogModeNormal;
 @class CLSettingsStore;
 static NSString* resolveAppBundleIdentifier(void);
 static NSString* resolveExistingDataContainerRoot(NSString* bid);
@@ -46,6 +53,7 @@ static BOOL writeMergedConfigDictionaryToDisk(NSDictionary* fallbackPreferences,
                                               NSString** pathOut,
                                               NSError** errorOut,
                                               NSMutableDictionary** mergedPreferencesOut);
+static void repairSharedConfigFileOwnership(NSString* confPath);
 static BOOL ensureStoreConfigFileExists(CLSettingsStore* store, NSString** pathOut, NSError** errorOut);
 
 static NSString* normalizedAbsolutePath(NSString* path) {
@@ -797,6 +805,7 @@ void setAppDocumentsPathOverride(NSString* docsPath) {
         g_logPath = nil;
         g_confPath = nil;
         g_dbPath = nil;
+        g_pathResolutionSource = @"uninitialized";
     }
     NSLog2(@"[CL] app documents override set: %@", fixed);
 }
@@ -816,6 +825,83 @@ static NSString* resolveJbRootFromSelfExe() {
         return nil;
     }
     return [exe substringToIndex:tail.location];
+}
+
+int CLRepairRoothideLaunchDaemonPlist(void) {
+    if (getJBType() != JBTYPE_ROOTHIDE) {
+        return 0;
+    }
+    if (geteuid() != 0) {
+        NSLog2(@"[CL] roothide_launchd_plist_repair result=failed stage=privilege euid=%d", geteuid());
+        return -1;
+    }
+
+    NSString* daemonSuffix = @"/Applications/ChargeLimiter.app/ChargeLimiterDaemon";
+    NSString* daemonPath = normalizedAbsolutePath(getSelfExePath());
+    NSString* jbRoot = resolveJbRootFromSelfExe();
+    NSString* expectedDaemonPath = jbRoot.length > 0
+        ? [jbRoot stringByAppendingString:daemonSuffix]
+        : nil;
+    if (daemonPath.length == 0 || ![daemonPath hasSuffix:daemonSuffix] ||
+        jbRoot.length == 0 || ![daemonPath isEqualToString:expectedDaemonPath]) {
+        NSLog2(@"[CL] roothide_launchd_plist_repair result=failed stage=validate_daemon_path");
+        return -1;
+    }
+
+    NSString* plistPath = [jbRoot stringByAppendingPathComponent:
+        @"Library/LaunchDaemons/com.chargelimiter.mod.plist"];
+    NSError* error = nil;
+    NSData* plistData = [NSData dataWithContentsOfFile:plistPath options:0 error:&error];
+    if (plistData.length == 0) {
+        NSLog2(@"[CL] roothide_launchd_plist_repair result=failed stage=read_plist error_domain=%@ error_code=%ld",
+               error.domain ?: @"unknown", (long)error.code);
+        return -1;
+    }
+
+    NSPropertyListFormat format = NSPropertyListXMLFormat_v1_0;
+    id propertyList = [NSPropertyListSerialization propertyListWithData:plistData
+                                                                options:NSPropertyListMutableContainersAndLeaves
+                                                                 format:&format
+                                                                  error:&error];
+    if (![propertyList isKindOfClass:[NSDictionary class]]) {
+        NSLog2(@"[CL] roothide_launchd_plist_repair result=failed stage=parse_plist error_domain=%@ error_code=%ld",
+               error.domain ?: @"unknown", (long)error.code);
+        return -1;
+    }
+
+    NSMutableDictionary* plist = [(NSDictionary*)propertyList mutableCopy];
+    NSArray* expectedArguments = @[daemonPath];
+    id currentProgram = plist[@"Program"];
+    id currentArguments = plist[@"ProgramArguments"];
+    BOOL needsUpdate = ![currentProgram isKindOfClass:[NSString class]] ||
+                       ![(NSString*)currentProgram isEqualToString:daemonPath] ||
+                       ![currentArguments isKindOfClass:[NSArray class]] ||
+                       ![(NSArray*)currentArguments isEqualToArray:expectedArguments];
+    if (needsUpdate) {
+        plist[@"Program"] = daemonPath;
+        plist[@"ProgramArguments"] = expectedArguments;
+        NSData* updatedData = [NSPropertyListSerialization dataWithPropertyList:plist
+                                                                         format:format
+                                                                        options:0
+                                                                          error:&error];
+        if (updatedData.length == 0 ||
+            ![updatedData writeToFile:plistPath options:NSDataWritingAtomic error:&error]) {
+            NSLog2(@"[CL] roothide_launchd_plist_repair result=failed stage=write_plist error_domain=%@ error_code=%ld",
+                   error.domain ?: @"unknown", (long)error.code);
+            return -1;
+        }
+    }
+
+    const char* plistFile = plistPath.fileSystemRepresentation;
+    if (chown(plistFile, 0, 0) != 0 || chmod(plistFile, 0644) != 0) {
+        int savedErrno = errno;
+        NSLog2(@"[CL] roothide_launchd_plist_repair result=failed stage=restore_metadata errno=%d", savedErrno);
+        return -1;
+    }
+
+    NSLog2(@"[CL] roothide_launchd_plist_repair result=%@",
+           needsUpdate ? @"updated" : @"unchanged");
+    return needsUpdate ? 1 : 0;
 }
 
 static NSString* resolveRoothidePathByAPI(NSString* logicalPath) {
@@ -1006,37 +1092,69 @@ static void ensureAppPathsWithLibroot() {
         NSString* sharedDataRoot = getSharedDataRootPathWithLibroot();
         NSString* configRoot = getConfigRootPathWithLibroot();  // config 用 app 数据容器（不依赖 jbroot）
 
+        BOOL usedFallback = NO;
         if (!appDoc || !sharedDataRoot || !configRoot) {
             NSLog2(@"[CL] CRITICAL: Path resolution failed. appDoc=%@ sharedDataRoot=%@ configRoot=%@",
                    appDoc, sharedDataRoot, configRoot);
             if (getJBType() == JBTYPE_ROOTHIDE) {
-                return;
+                // jbroot() 运行时解析失败（libroothide 缺失/不可用）时，不静默早退，
+                // 改从自身可执行路径推导 .jbroot-XXX/var/mobile/ChargeLimiter 作为共享数据根，
+                // 至少让 daemon 能落日志（aldente.log），否则 NSFileErrorLog 全程静默空转。
+                NSString* exeJbRoot = resolveJbRootFromSelfExe();
+                NSString* exeSharedRoot = exeJbRoot.length > 0
+                    ? [exeJbRoot stringByAppendingPathComponent:@"var/mobile/ChargeLimiter"]
+                    : nil;
+                if (exeSharedRoot.length == 0) {
+                    NSLog2(@"[CL] roothide exe-jbroot fallback failed: exeJbRoot=%@", exeJbRoot ?: @"(nil)");
+                    return;
+                }
+                NSLog2(@"[CL] roothide path fallback via exe jbroot: sharedDataRoot=%@", exeSharedRoot);
+                appDoc = exeSharedRoot;
+                sharedDataRoot = exeSharedRoot;
+                configRoot = exeSharedRoot;
+                usedFallback = YES;
+            } else {
+                // 降级到应用沙盒（仅在极端情况）
+                NSString* fallback = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+                appDoc = appDoc ?: fallback;
+                sharedDataRoot = sharedDataRoot ?: fallback;
+                configRoot = configRoot ?: fallback;
+                usedFallback = YES;
             }
-            // 降级到应用沙盒（仅在极端情况）
-            NSString* fallback = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-            appDoc = appDoc ?: fallback;
-            sharedDataRoot = sharedDataRoot ?: fallback;
-            configRoot = configRoot ?: fallback;
         }
 
-        // 创建目录
-        NSFileManager* fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:appDoc withIntermediateDirectories:YES attributes:nil error:nil];
-        [fm createDirectoryAtPath:sharedDataRoot withIntermediateDirectories:YES attributes:nil error:nil];
-        [fm createDirectoryAtPath:configRoot withIntermediateDirectories:YES attributes:nil error:nil];
+        // Finalize primary and fallback paths through one exit
+        if (appDoc.length == 0 || sharedDataRoot.length == 0 || configRoot.length == 0) {
+            NSLog2(@"[CL] CRITICAL: Refusing incomplete paths after fallback");
+            return;
+        }
 
-        // 设置全局变量
+        NSFileManager* fm = [NSFileManager defaultManager];
+        for (NSString* dir in @[appDoc, sharedDataRoot, configRoot]) {
+            NSError* mkdirError = nil;
+            if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&mkdirError]) {
+                NSLog2(@"[CL] CRITICAL: Path directory create failed path=%@ error=%@", dir, mkdirError);
+                return;
+            }
+        }
+
         g_appDocumentsPath = appDoc;
         g_runtimeDataRootPath = sharedDataRoot;
         g_logPath = [sharedDataRoot stringByAppendingPathComponent:@LOG_FILENAME];
         g_confPath = [configRoot stringByAppendingPathComponent:@CONFIG_PLIST_FILENAME];
         g_dbPath = [sharedDataRoot stringByAppendingPathComponent:@DB_FILENAME];
-
-        NSLog2(@"[CL] Paths initialized (libroot):");
-        NSLog2(@"  Config: %@", g_confPath);
-        NSLog2(@"  Log: %@", g_logPath);
-        NSLog2(@"  DB: %@", g_dbPath);
-
+        if (usedFallback) {
+            g_pathResolutionSource = @"exe-fallback";
+        } else if (getJBType() == JBTYPE_ROOTHIDE) {
+            g_pathResolutionSource = @"libroothide";
+        } else if (getJBType() == JBTYPE_TROLLSTORE) {
+            g_pathResolutionSource = @"sandbox";
+        } else {
+            g_pathResolutionSource = @"libroot";
+        }
+        NSLog2(@"[CL] path_init source=%@ pid=%d uid=%d euid=%d gid=%d egid=%d conf=%@ log=%@ db=%@",
+                       g_pathResolutionSource, getpid(), getuid(), geteuid(), getgid(), getegid(),
+                       g_confPath, g_logPath, g_dbPath);
         cleanupLegacyContainerCacheFilesIfNeeded();
     }
 }
@@ -1057,6 +1175,10 @@ NSString* getRuntimeDataRootPath(void) {
 
 extern "C" NSString* getRuntimeDataRootPath_C(void) {
     return getRuntimeDataRootPath();
+}
+
+extern "C" NSString* getLogPath_C(void) {
+    return getLogPath();
 }
 
 NSString* getLogPath() {
@@ -1301,6 +1423,65 @@ static NSArray<NSString*>* getConfigReadPathsWithLibroot(void) {
 // REFACTOR: 简化的配置读写函数（使用 libroot）
 // ============================================================================
 
+static NSDictionary* configPathMetadata(NSString* path) {
+    NSMutableDictionary* out = [NSMutableDictionary dictionary];
+    out[@"config_path"] = path ?: @"";
+    NSString* parent = path.length > 0 ? path.stringByDeletingLastPathComponent : @"";
+    out[@"config_parent_path"] = parent;
+    out[@"config_parent_writable"] = @(parent.length > 0 && access(parent.fileSystemRepresentation, W_OK) == 0);
+
+    struct stat st = {};
+    if (path.length > 0 && stat(path.fileSystemRepresentation, &st) == 0) {
+        out[@"config_exists"] = @YES;
+        out[@"config_size"] = @(st.st_size);
+        out[@"config_mtime"] = @(st.st_mtime);
+        out[@"config_mode"] = @(st.st_mode & 07777);
+        out[@"config_owner_uid"] = @(st.st_uid);
+        out[@"config_group_gid"] = @(st.st_gid);
+    } else {
+        out[@"config_exists"] = @NO;
+        out[@"config_size"] = @0;
+        out[@"config_mtime"] = @0;
+        out[@"config_mode"] = @(-1);
+        out[@"config_owner_uid"] = @(-1);
+        out[@"config_group_gid"] = @(-1);
+    }
+    return out;
+}
+
+static void recordConfigWriteDiagnostics(NSString* stage, NSError* error, int savedErrno, BOOL verified) {
+    @synchronized(NSFileManager.defaultManager) {
+        g_lastConfigWriteDiagnostics = @{
+            @"last_write_stage": stage ?: @"unknown",
+            @"last_write_error_domain": error.domain ?: @"",
+            @"last_write_error_code": @(error ? error.code : 0),
+            @"last_write_errno": @(savedErrno),
+            @"last_write_verified": @(verified),
+        };
+    }
+}
+
+static BOOL verifyWrittenConfigData(NSString* path, NSError** errorOut) {
+    NSData* data = [NSData dataWithContentsOfFile:path options:0 error:errorOut];
+    if (data.length == 0) {
+        return NO;
+    }
+    NSPropertyListFormat format = NSPropertyListBinaryFormat_v1_0;
+    id plist = [NSPropertyListSerialization propertyListWithData:data
+                                                         options:NSPropertyListImmutable
+                                                          format:&format
+                                                           error:errorOut];
+    if ([plist isKindOfClass:[NSDictionary class]]) {
+        return YES;
+    }
+    if (errorOut && *errorOut == nil) {
+        *errorOut = [NSError errorWithDomain:@"ChargeLimiter"
+                                        code:-3
+                                    userInfo:@{NSLocalizedDescriptionKey: @"Written config is not a dictionary plist"}];
+    }
+    return NO;
+}
+
 /**
  * 写入配置数据到磁盘（新实现 - 单一路径）
  *
@@ -1308,23 +1489,26 @@ static NSArray<NSString*>* getConfigReadPathsWithLibroot(void) {
  * 当前路径初始化已按越狱类型解析，所以不需要多次写入尝试。
  */
 static BOOL writeConfigDataToDiskWithLibroot(NSData* plistData, NSString** pathOut, NSError** errorOut) {
+    if (pathOut) {
+        *pathOut = nil;
+    }
     if (!plistData || plistData.length == 0) {
-        if (errorOut) {
-            *errorOut = [NSError errorWithDomain:@"ChargeLimiter"
-                                            code:-1
-                                        userInfo:@{NSLocalizedDescriptionKey: @"Empty plist data"}];
-        }
+        NSError* error = [NSError errorWithDomain:@"ChargeLimiter"
+                                             code:-1
+                                         userInfo:@{NSLocalizedDescriptionKey: @"Empty plist data"}];
+        recordConfigWriteDiagnostics(@"write_failed", error, 0, NO);
+        if (errorOut) *errorOut = error;
         return NO;
     }
 
     NSString* confPath = getConfigWritePathWithLibroot();
     if (!confPath || confPath.length == 0) {
         NSLog2(@"[CL] ERROR: Failed to get config write path");
-        if (errorOut) {
-            *errorOut = [NSError errorWithDomain:@"ChargeLimiter"
-                                            code:-2
-                                        userInfo:@{NSLocalizedDescriptionKey: @"Invalid config path"}];
-        }
+        NSError* error = [NSError errorWithDomain:@"ChargeLimiter"
+                                             code:-2
+                                         userInfo:@{NSLocalizedDescriptionKey: @"Invalid config path"}];
+        recordConfigWriteDiagnostics(@"invalid_path", error, 0, NO);
+        if (errorOut) *errorOut = error;
         return NO;
     }
 
@@ -1335,31 +1519,71 @@ static BOOL writeConfigDataToDiskWithLibroot(NSData* plistData, NSString** pathO
 
     if (![fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:&mkdirError]) {
         NSLog2(@"[CL] ERROR: Failed to create directory %@: %@", parent, mkdirError);
-        if (errorOut) {
-            *errorOut = mkdirError;
-        }
+        recordConfigWriteDiagnostics(@"mkdir_failed", mkdirError, errno, NO);
+        if (errorOut) *errorOut = mkdirError;
         return NO;
     }
 
     // 原子写入
     NSError* writeError = nil;
     if ([plistData writeToFile:confPath options:NSDataWritingAtomic error:&writeError]) {
-        NSLog2(@"[CL] Config written successfully: %@ (%lu bytes)", confPath, (unsigned long)plistData.length);
-        if (pathOut) {
-            *pathOut = confPath;
+        NSError* verifyError = nil;
+        if (verifyWrittenConfigData(confPath, &verifyError)) {
+            recordConfigWriteDiagnostics(@"atomic_verified", nil, 0, YES);
+            NSLog2(@"[CL] Config written successfully: %@ (%lu bytes)", confPath, (unsigned long)plistData.length);
+            if (pathOut) *pathOut = confPath;
+            return YES;
         }
-        return YES;
+        recordConfigWriteDiagnostics(@"verify_failed", verifyError, errno, NO);
+        if (errorOut) *errorOut = verifyError;
+        return NO;
     }
 
-    // 写入失败
-    NSLog2(@"[CL] ERROR: Failed to write config to %@: %@", confPath, writeError);
-    if (pathOut) {
-        *pathOut = nil;
+    // 原子写失败（roothide 的 .jbroot FUSE 文件系统上 rename/临时文件可能受限），
+    // 降级为非原子直接写。记录原始 errno 供诊断。
+    int atomicErrno = errno;
+    if (writeError != nil) {
+        NSLog2(@"[CL] ERROR: Atomic config write failed to %@: %@ (code=%ld)", confPath, writeError,
+               (long)writeError.code);
+    } else {
+        NSLog2(@"[CL] ERROR: Atomic config write failed to %@ errno=%d", confPath, atomicErrno);
     }
-    if (errorOut) {
-        *errorOut = writeError;
+
+    NSError* directError = nil;
+    if ([plistData writeToFile:confPath options:NSDataWritingFileProtectionNone error:&directError]) {
+        NSError* verifyError = nil;
+        if (verifyWrittenConfigData(confPath, &verifyError)) {
+            recordConfigWriteDiagnostics(@"direct_verified", writeError, atomicErrno, YES);
+            NSLog2(@"[CL] Config written via non-atomic fallback: %@ (%lu bytes) [atomic_errno=%d]",
+                   confPath, (unsigned long)plistData.length, atomicErrno);
+            if (pathOut) *pathOut = confPath;
+            return YES;
+        }
+        recordConfigWriteDiagnostics(@"verify_failed", verifyError, errno, NO);
+        if (errorOut) *errorOut = verifyError;
+        return NO;
     }
+
+    NSLog2(@"[CL] ERROR: Config write failed (atomic+direct) to %@: %@", confPath,
+           directError ?: (writeError ?: @"unknown"));
+    recordConfigWriteDiagnostics(@"write_failed", directError ?: writeError, errno, NO);
+    if (errorOut) *errorOut = directError ?: writeError;
     return NO;
+}
+
+extern "C" NSDictionary* getConfigPersistenceDiagnostics_C(void) {
+    NSMutableDictionary* out = [configPathMetadata(getConfPath()) mutableCopy];
+    out[@"path_resolution_source"] = g_pathResolutionSource ?: @"uninitialized";
+    @synchronized(NSFileManager.defaultManager) {
+        [out addEntriesFromDictionary:g_lastConfigWriteDiagnostics ?: @{
+            @"last_write_stage": @"never",
+            @"last_write_error_domain": @"",
+            @"last_write_error_code": @0,
+            @"last_write_errno": @0,
+            @"last_write_verified": @NO,
+        }];
+    }
+    return out;
 }
 
 /**
@@ -1448,7 +1672,47 @@ static BOOL writeMergedConfigDictionaryToDisk(NSDictionary* fallbackPreferences,
     if (mergedPreferencesOut) {
         *mergedPreferencesOut = mergedPreferences;
     }
+    // root 写盘成功后交还 mobile 所有权，避免 App 原子替换失败
+    repairSharedConfigFileOwnership(writtenPath);
     return YES;
+}
+
+/**
+ * 若当前 euid==0，将共享配置文件与其目录交还 mobile:mobile。
+ * 文件 0640，目录 0750。单点失败只打日志，不反向影响写成功结果。
+ */
+static void repairSharedConfigFileOwnership(NSString* confPath) {
+    if (confPath.length == 0 || geteuid() != 0) {
+        return;
+    }
+
+    struct passwd* pw = getpwnam("mobile");
+    if (pw == NULL) {
+        NSLog2(@"[CL] repairSharedConfigFileOwnership: getpwnam(mobile) failed path=%@", confPath);
+        return;
+    }
+
+    uid_t uid = pw->pw_uid;
+    gid_t gid = pw->pw_gid;
+    NSString* dir = [confPath stringByDeletingLastPathComponent];
+    const char* filePathC = confPath.fileSystemRepresentation;
+    const char* dirPathC = dir.length > 0 ? dir.fileSystemRepresentation : NULL;
+
+    if (dirPathC != NULL) {
+        if (chown(dirPathC, uid, gid) != 0) {
+            NSLog2(@"[CL] repairSharedConfigFileOwnership: chown dir failed path=%@ errno=%d", dir, errno);
+        }
+        if (chmod(dirPathC, 0750) != 0) {
+            NSLog2(@"[CL] repairSharedConfigFileOwnership: chmod dir 0750 failed path=%@ errno=%d", dir, errno);
+        }
+    }
+
+    if (chown(filePathC, uid, gid) != 0) {
+        NSLog2(@"[CL] repairSharedConfigFileOwnership: chown file failed path=%@ errno=%d", confPath, errno);
+    }
+    if (chmod(filePathC, 0640) != 0) {
+        NSLog2(@"[CL] repairSharedConfigFileOwnership: chmod file 0640 failed path=%@ errno=%d", confPath, errno);
+    }
 }
 
 static NSArray<NSString*>* currentConfigCleanupPathCandidates(void) {
@@ -2354,6 +2618,10 @@ int get_sys_boottime() {
     return ts;
 }
 
+extern "C" int get_sys_boottime_C(void) {
+    return get_sys_boottime();
+}
+
 NSString* findAppPath(NSString* name) {
     if (name == nil) {
         return nil;
@@ -2399,8 +2667,21 @@ NSString* getLocalIP() { // 获取wifi ipv4
     return result;
 }
 
-BOOL localPortOpen(int port) {
+static NSDictionary* CLLocalPortProbe(int port) {
+    NSMutableDictionary* result = [@{
+        @"socket_errno": @0,
+        @"connect_rc": @(-1),
+        @"connect_errno": @0,
+        @"select_rc": @(-1),
+        @"select_errno": @0,
+        @"so_error": @(-1),
+        @"open": @NO,
+    } mutableCopy];
     int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        result[@"socket_errno"] = @(errno);
+        return result;
+    }
     struct sockaddr_in ip4;
     memset(&ip4, 0, sizeof(struct sockaddr_in));
     ip4.sin_len = sizeof(ip4);
@@ -2410,18 +2691,38 @@ BOOL localPortOpen(int port) {
     int so_error = -1;
     struct timeval tv;
     fd_set fdset;
-    fcntl(sock, F_SETFL, O_NONBLOCK);
-    connect(sock, (struct sockaddr*)&ip4, sizeof(ip4));
+    int currentFlags = fcntl(sock, F_GETFL, 0);
+    if (currentFlags >= 0) {
+        fcntl(sock, F_SETFL, currentFlags | O_NONBLOCK);
+    }
+    errno = 0;
+    int connectRc = connect(sock, (struct sockaddr*)&ip4, sizeof(ip4));
+    int connectErrno = connectRc == 0 ? 0 : errno;
+    result[@"connect_rc"] = @(connectRc);
+    result[@"connect_errno"] = @(connectErrno);
     FD_ZERO(&fdset);
     FD_SET(sock, &fdset);
     tv.tv_sec = 1;
     tv.tv_usec = 0;
-    if (select(sock + 1, NULL, &fdset, NULL, &tv) == 1) {
+    errno = 0;
+    int selectRc = select(sock + 1, NULL, &fdset, NULL, &tv);
+    int selectErrno = selectRc < 0 ? errno : 0;
+    result[@"select_rc"] = @(selectRc);
+    result[@"select_errno"] = @(selectErrno);
+    if (selectRc == 1) {
         socklen_t len = sizeof(so_error);
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0) {
+            so_error = errno;
+        }
     }
     close(sock);
-    return 0 == so_error;
+    result[@"so_error"] = @(so_error);
+    result[@"open"] = @(so_error == 0);
+    return result;
+}
+
+BOOL localPortOpen(int port) {
+    return [CLLocalPortProbe(port)[@"open"] boolValue];
 }
 
 extern "C" int _NSGetExecutablePath(char* buf, uint32_t* bufsize);
@@ -2443,6 +2744,10 @@ NSString* getSelfExePath() {
     }
     free(exe);
     return path;
+}
+
+extern "C" NSString* getSelfExePath_C(void) {
+    return getSelfExePath();
 }
 
 int getJBType() {
@@ -2501,6 +2806,10 @@ int getJBType() {
     // todo
 }
 
+extern "C" int getJBType_C(void) {
+    return getJBType();
+}
+
 extern "C" int restartDaemonForApp_C(NSString* appDocs) {
     NSString* bundlePath = [getSelfExePath() stringByDeletingLastPathComponent];
     NSString* daemonPath = [bundlePath stringByAppendingPathComponent:@"ChargeLimiterDaemon"];
@@ -2518,7 +2827,9 @@ extern "C" int restartDaemonForApp_C(NSString* appDocs) {
     int jbType = getJBType();
     int spawnFlags = SPAWN_FLAG_NOWAIT;
     BOOL triedRoot = NO;
-    if (jbType != JBTYPE_TROLLSTORE) {
+    // relaxin/roothide: root persona spawn 子进程 exec 失败 exit 126；
+    // daemon 有 setuid +s 位 + platformize_me() 提权，无需 root persona。
+    if (jbType != JBTYPE_TROLLSTORE && jbType != JBTYPE_ROOTHIDE) {
         spawnFlags |= SPAWN_FLAG_ROOT;
         triedRoot = YES;
     }
@@ -2538,7 +2849,118 @@ extern "C" int restartDaemonForApp_C(NSString* appDocs) {
     return rc;
 }
 
-static void NSFileLogWithArguments(NSString* fmt, va_list va) {
+// === daemon 链路修复工具（App 侧）===
+// 定位逻辑与 restartDaemonForApp_C 相同：App 自身 bundle 目录下的 ChargeLimiterDaemon
+static NSString* CLDaemonPathForApp(void) {
+    NSString* bundlePath = [getSelfExePath() stringByDeletingLastPathComponent];
+    if (bundlePath.length == 0) {
+        return @"";
+    }
+    return [bundlePath stringByAppendingPathComponent:@"ChargeLimiterDaemon"];
+}
+
+// 从自身 exe 截取 .jbroot-XXX 前缀（launchctl plist 候选路径推导用）
+static NSString* CLDaemonJbRootPath(void) {
+    NSString* exe = getSelfExePath();
+    NSArray* parts = [exe componentsSeparatedByString:@"/"];
+    NSMutableArray* kept = [NSMutableArray array];
+    for (NSString* p in parts) {
+        [kept addObject:p];
+        if ([p hasPrefix:@".jbroot-"]) {
+            break;
+        }
+    }
+    NSString* root = [kept componentsJoinedByString:@"/"];
+    return (root.length > 1) ? root : @"";
+}
+
+// aldente.log 尾部（daemon 离线时的“尸检报告”）
+static NSString* CLReadDaemonLogTail(NSInteger maxLines) {
+    if (maxLines <= 0) {
+        maxLines = 1;
+    }
+    NSString* logPath = getLogPath();
+    if (logPath.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:logPath]) {
+        return @"";
+    }
+    NSString* content = [NSString stringWithContentsOfFile:logPath
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:nil];
+    if (content.length == 0) {
+        return @"";
+    }
+    NSArray<NSString*>* lines = [content componentsSeparatedByString:@"\n"];
+    NSInteger count = (NSInteger)lines.count;
+    NSInteger keep = MIN(count, maxLines);
+    NSArray<NSString*>* tail = [lines subarrayWithRange:NSMakeRange((NSUInteger)(count - keep),
+                                                                   (NSUInteger)keep)];
+    return [tail componentsJoinedByString:@"\n"];
+}
+
+static void CLRecordChildLifecycle(NSMutableDictionary* out, NSString* prefix, pid_t pid) {
+    NSString* safePrefix = prefix.length ? prefix : @"child";
+    NSString* pidKey = [safePrefix stringByAppendingString:@"_pid"];
+    NSString* aliveKey = [safePrefix stringByAppendingString:@"_alive"];
+    NSString* waitKey = [safePrefix stringByAppendingString:@"_wait_status"];
+    NSString* exitKey = [safePrefix stringByAppendingString:@"_exit_code"];
+    NSString* signalKey = [safePrefix stringByAppendingString:@"_signal"];
+    NSString* waitErrnoKey = [safePrefix stringByAppendingString:@"_wait_errno"];
+    NSString* probeErrnoKey = [safePrefix stringByAppendingString:@"_probe_errno"];
+    out[pidKey] = @(pid);
+    out[aliveKey] = @NO;
+    out[waitKey] = @(-1);
+    out[exitKey] = @(-1);
+    out[signalKey] = @(-1);
+    out[waitErrnoKey] = @(0);
+    out[probeErrnoKey] = @(0);
+    if (pid <= 0) {
+        return;
+    }
+
+    int status = 0;
+    pid_t waitResult = waitpid(pid, &status, WNOHANG);
+    if (waitResult == 0) {
+        errno = 0;
+        int probe = kill(pid, 0);
+        int probeErrno = (probe == 0) ? 0 : errno;
+        out[aliveKey] = @((probe == 0) || (probe < 0 && probeErrno == EPERM));
+        out[probeErrnoKey] = @(probeErrno);
+        return;
+    }
+    if (waitResult < 0) {
+        int waitErrno = errno;
+        errno = 0;
+        int probe = kill(pid, 0);
+        int probeErrno = (probe == 0) ? 0 : errno;
+        out[aliveKey] = @((probe == 0) || (probe < 0 && probeErrno == EPERM));
+        out[waitErrnoKey] = @(waitErrno);
+        out[probeErrnoKey] = @(probeErrno);
+        return;
+    }
+
+    out[waitKey] = @(status);
+    if (WIFEXITED(status)) {
+        out[exitKey] = @(WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        out[signalKey] = @(WTERMSIG(status));
+    }
+}
+
+static void CLFileLogUpdateModeFromObject(id obj) {
+    CLFileLogMode mode = CLFileLogModeNormal;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSString* levelStr = [(NSDictionary *)obj objectForKey:@"log_level"];
+        if ([levelStr isKindOfClass:[NSString class]]) {
+            mode = CLFileLogModeFromCString([levelStr UTF8String]);
+        }
+    }
+    __atomic_store_n(&g_fileLogMode, mode, __ATOMIC_SEQ_CST);
+}
+
+static void NSFileLogWithArguments(CLFileLogSeverity sev, NSString* fmt, va_list va) {
+    if (!CLFileLogShouldWrite(__atomic_load_n(&g_fileLogMode, __ATOMIC_SEQ_CST), sev)) {
+        return;
+    }
     NSDateFormatter* formatter = [NSDateFormatter new];
     [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
     NSString* dateStr = [formatter stringFromDate:NSDate.date];
@@ -2546,6 +2968,7 @@ static void NSFileLogWithArguments(NSString* fmt, va_list va) {
     content = [NSString stringWithFormat:@"%@ %@\n", dateStr, content];
     NSString* logPath = getLogPath();
     if (logPath.length == 0) {
+        NSLog2(@"[CL] FATAL: no writable log path, drop line: %@", content);
         return;
     }
     static const unsigned long long kMaxFileLogBytes = 256 * 1024;
@@ -2567,7 +2990,14 @@ static void NSFileLogWithArguments(NSString* fmt, va_list va) {
 void NSFileErrorLog(NSString* fmt, ...) {
     va_list va;
     va_start(va, fmt);
-    NSFileLogWithArguments(fmt, va);
+    NSFileLogWithArguments(CLFileLogSeverityError, fmt, va);
+    va_end(va);
+}
+
+void NSFileInfoLog(NSString* fmt, ...) {
+    va_list va;
+    va_start(va, fmt);
+    NSFileLogWithArguments(CLFileLogSeverityInfo, fmt, va);
     va_end(va);
 }
 
@@ -2625,6 +3055,224 @@ NSArray* getUnusedFds() { // posix_spawn会将socket等fd继承给子进程
 
 #define PROC_PIDPATHINFO                11
 #define PROC_PIDPATHINFO_SIZE           (MAXPATHLEN)
+
+// 只读探针：不做任何副作用，供诊断报告离线段使用
+extern "C" NSDictionary* clDaemonLaunchProbe_C(void) {
+    NSString* daemonPath = CLDaemonPathForApp();
+    NSString* logPath = getLogPath();
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSMutableDictionary* out = [NSMutableDictionary dictionary];
+    out[@"daemon_path"] = daemonPath ?: @"";
+    out[@"daemon_exists"] = @([fm fileExistsAtPath:daemonPath]);
+    out[@"daemon_executable"] = @([fm isExecutableFileAtPath:daemonPath]);
+    NSError* daemonAttrError = nil;
+    NSDictionary* daemonAttrs = [fm attributesOfItemAtPath:daemonPath error:&daemonAttrError];
+    out[@"daemon_mode"] = daemonAttrs[NSFilePosixPermissions] ?: @(-1);
+    out[@"daemon_owner_uid"] = daemonAttrs[NSFileOwnerAccountID] ?: @(-1);
+    out[@"daemon_group_gid"] = daemonAttrs[NSFileGroupOwnerAccountID] ?: @(-1);
+    out[@"daemon_attr_error"] = daemonAttrError.localizedDescription ?: @"";
+    out[@"daemon_process_pid"] = @(get_pid_of("ChargeLimiterDaemon"));
+    NSDictionary* portProbe = CLLocalPortProbe(GSERV_PORT);
+    out[@"port_probe"] = portProbe;
+    out[@"initial_port_open"] = portProbe[@"open"] ?: @NO;
+    out[@"log_path"] = logPath ?: @"";
+    out[@"log_exists"] = @([fm fileExistsAtPath:logPath]);
+    out[@"log_writable"] = @([fm isWritableFileAtPath:logPath]);
+    out[@"log_parent_writable"] = @([fm isWritableFileAtPath:logPath.stringByDeletingLastPathComponent]);
+    NSError* logAttrError = nil;
+    NSDictionary* logAttrs = [fm attributesOfItemAtPath:logPath error:&logAttrError];
+    out[@"log_size"] = logAttrs[NSFileSize] ?: @(-1);
+    out[@"log_mode"] = logAttrs[NSFilePosixPermissions] ?: @(-1);
+    out[@"log_owner_uid"] = logAttrs[NSFileOwnerAccountID] ?: @(-1);
+    out[@"log_group_gid"] = logAttrs[NSFileGroupOwnerAccountID] ?: @(-1);
+    NSDate* logMtime = logAttrs[NSFileModificationDate];
+    out[@"log_mtime"] = logMtime ? @(logMtime.timeIntervalSince1970) : @0;
+    NSError* logReadError = nil;
+    if (logPath.length > 0 && [fm fileExistsAtPath:logPath]) {
+        [NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:&logReadError];
+    }
+    out[@"log_read_error"] = logReadError.localizedDescription ?: (logAttrError.localizedDescription ?: @"");
+    out[@"log_tail"] = CLReadDaemonLogTail(20);
+    return out;
+}
+
+extern "C" NSDictionary* clRepairDaemonForApp_C(void) {
+    // 自愈 + 报告：用户显式触发。kill 残留 → spawn(root→非root) → 等端口 → launchctl 尽力而为。
+    // nonroot_spawn_rc：根/便携回退失败时的 rc；仅在 root 失败且非 TrollStore 环境时尝试，否则 -999。
+    NSString* daemonPath = CLDaemonPathForApp();
+    NSMutableDictionary* out = [NSMutableDictionary dictionary];
+    out[@"daemon_path"] = daemonPath ?: @"";
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:daemonPath];
+    out[@"daemon_exists"] = @(exists);
+
+    BOOL alreadyOpen = localPortOpen(GSERV_PORT);
+    out[@"initial_port_open"] = @(alreadyOpen);
+    if (alreadyOpen) {
+        out[@"repair_result"] = @"already_up";
+        out[@"final_port_open"] = @YES;
+        out[@"log_tail"] = CLReadDaemonLogTail(20);
+        return out;
+    }
+    if (!exists) {
+        out[@"repair_result"] = @"path_missing";
+        out[@"final_port_open"] = @NO;
+        out[@"log_tail"] = CLReadDaemonLogTail(20);
+        return out;
+    }
+
+    int jbType = getJBType();
+    int rootFlags = (jbType != JBTYPE_TROLLSTORE && jbType != JBTYPE_ROOTHIDE) ? SPAWN_FLAG_ROOT : 0;
+
+    NSString* jbRoot = CLDaemonJbRootPath();
+    NSMutableArray* launchctlCandidates = [NSMutableArray arrayWithObjects:
+        @"/bin/launchctl", @"/usr/bin/launchctl", nil];
+    if (jbRoot.length > 0) {
+        [launchctlCandidates addObject:[jbRoot stringByAppendingPathComponent:@"bin/launchctl"]];
+        [launchctlCandidates addObject:[jbRoot stringByAppendingPathComponent:@"usr/bin/launchctl"]];
+    }
+    NSString* launchctlPath = launchctlCandidates.firstObject;
+    for (NSString* candidate in launchctlCandidates) {
+        if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+            launchctlPath = candidate;
+            break;
+        }
+    }
+    out[@"launchctl_path_candidates"] = launchctlCandidates.copy;
+    out[@"launchctl_path"] = launchctlPath ?: @"";
+    out[@"launchctl_exists"] = @([[NSFileManager defaultManager] isExecutableFileAtPath:launchctlPath]);
+    NSMutableArray* plistCandidates = [NSMutableArray arrayWithObject:
+        @"/Library/LaunchDaemons/com.chargelimiter.mod.plist"];
+    if (jbRoot.length > 0) {
+        [plistCandidates addObject:
+            [jbRoot stringByAppendingPathComponent:@"Library/LaunchDaemons/com.chargelimiter.mod.plist"]];
+    }
+    NSMutableArray* plistExisting = [NSMutableArray array];
+    for (NSString* plist in plistCandidates) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:plist]) {
+            [plistExisting addObject:plist];
+        }
+    }
+    out[@"plist_candidates"] = plistCandidates.copy;
+    out[@"plist_existing"] = plistExisting.copy;
+
+    // 1) 杀残留 daemon（best-effort；EPERM/ENOENT 属预期，rc 记录）
+    NSMutableArray* killallCandidates = [NSMutableArray arrayWithObjects:
+        @"/usr/bin/killall", @"/bin/killall", nil];
+    if (jbRoot.length > 0) {
+        [killallCandidates addObject:[jbRoot stringByAppendingPathComponent:@"usr/bin/killall"]];
+        [killallCandidates addObject:[jbRoot stringByAppendingPathComponent:@"bin/killall"]];
+    }
+    NSString* killallPath = killallCandidates.firstObject;
+    for (NSString* candidate in killallCandidates) {
+        if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+            killallPath = candidate;
+            break;
+        }
+    }
+    out[@"killall_path"] = killallPath ?: @"";
+    out[@"killall_exists"] = @([[NSFileManager defaultManager] isExecutableFileAtPath:killallPath]);
+    out[@"kill_rc"] = @(spawn(@[killallPath, @"-9", @"ChargeLimiterDaemon"],
+                               nil, nil, nil, rootFlags, nil));
+
+    // 2) spawn daemon：root 优先，EPERM 时 nonroot（口径与 restartDaemonForApp_C 一致）
+    NSMutableArray* argv = [NSMutableArray arrayWithObject:daemonPath];
+    NSString* appDocs = getAppDocumentsPath();
+    if (appDocs.length > 0) {
+        [argv addObject:@"--app-docs"];
+        [argv addObject:appDocs];
+    }
+    pid_t rootPid = -1;
+    int rootRc = spawn(argv, nil, nil, &rootPid, SPAWN_FLAG_NOWAIT | rootFlags, nil);
+    out[@"root_spawn_rc"] = @(rootRc);
+    out[@"root_spawn_pid"] = @(rootPid);
+    int nonrootRc = -999;
+    pid_t nonrootPid = -1;
+    if (rootRc != 0 && rootFlags) {
+        nonrootRc = spawn(argv, nil, nil, &nonrootPid, SPAWN_FLAG_NOWAIT, nil);
+    }
+    out[@"nonroot_spawn_rc"] = @(nonrootRc);
+    out[@"nonroot_spawn_pid"] = @(nonrootPid);
+
+    // 3) 轮询 1230 至多 ~5s（300ms × 17）
+    BOOL afterSpawn = NO;
+    for (int i = 0; i < 17; i++) {
+        if (localPortOpen(GSERV_PORT)) {
+            afterSpawn = YES;
+            break;
+        }
+        usleep(300 * 1000);
+    }
+    out[@"port_after_spawn"] = @(afterSpawn);
+
+    // 记录 spawn 返回 0 后子进程是否还活着，以及退出码/信号。
+    pid_t observedPid = (rootRc == 0) ? rootPid : nonrootPid;
+    CLRecordChildLifecycle(out, @"child", observedPid);
+    out[@"child_alive"] = out[@"child_alive"] ?: @NO;
+    out[@"child_wait_status"] = out[@"child_wait_status"] ?: @(-1);
+    out[@"child_exit_code"] = out[@"child_exit_code"] ?: @(-1);
+    out[@"child_signal"] = out[@"child_signal"] ?: @(-1);
+    out[@"child_probe_errno"] = out[@"child_probe_errno"] ?: @(0);
+
+    // 4) launchctl 尽力而为（relaxin App sandbox 下常 EPERM；只留证，不重试）
+    NSInteger lrc = -1;
+    NSInteger bootoutRc = -1;
+    NSInteger printRc = -1;
+    NSString* printOut = @"";
+    NSString* lout = @"";
+    BOOL attempted = NO;
+    BOOL printAttempted = NO;
+    if (!afterSpawn) {
+        if ([out[@"launchctl_exists"] boolValue]) {
+            NSString* statusOut = nil;
+            NSString* statusErr = nil;
+            printAttempted = YES;
+            printRc = spawn(@[launchctlPath, @"print", @"system/com.chargelimiter.mod"],
+                            &statusOut, &statusErr, nil, rootFlags, nil);
+            printOut = statusErr.length ? statusErr : (statusOut ?: @"");
+            if (printOut.length > 4096) {
+                printOut = [printOut substringToIndex:4096];
+            }
+        }
+        for (NSString* plist in plistExisting) {
+            if (![out[@"launchctl_exists"] boolValue]) {
+                break;
+            }
+            NSString* bootOut = nil;
+            NSString* bootErr = nil;
+            bootoutRc = spawn(@[launchctlPath, @"bootout", @"system/com.chargelimiter.mod"],
+                              &bootOut, &bootErr, nil, rootFlags, nil);
+            NSString* splash = bootErr ?: (bootOut ?: @"");
+            NSString* bOut = nil;
+            NSString* bErr = nil;
+            lrc = spawn(@[launchctlPath, @"bootstrap", @"system", plist],
+                        &bOut, &bErr, nil, rootFlags, nil);
+            attempted = YES;
+            lout = bErr.length ? bErr : (bOut.length ? bOut : splash);
+            for (int i = 0; i < 10; i++) {
+                if (localPortOpen(GSERV_PORT)) {
+                    break;
+                }
+                usleep(300 * 1000);
+            }
+            break;
+        }
+    }
+    out[@"launchctl_attempted"] = @(attempted);
+    out[@"launchctl_print_attempted"] = @(printAttempted);
+    if (printAttempted) {
+        out[@"launchctl_print_rc"] = @((int)printRc);
+        out[@"launchctl_print_out"] = printOut ?: @"";
+    }
+    out[@"launchctl_bootout_rc"] = @((int)bootoutRc);
+    out[@"launchctl_rc"] = @((int)lrc);
+    out[@"launchctl_out"] = lout ?: @"";
+
+    BOOL finalOpen = localPortOpen(GSERV_PORT);
+    out[@"final_port_open"] = @(finalOpen);
+    out[@"repair_result"] = finalOpen ? @"recovered" : @"still_down";
+    out[@"log_tail"] = CLReadDaemonLogTail(20);
+    return out;
+}
 
 extern "C" {
 int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
@@ -3153,6 +3801,10 @@ static BOOL migrateLegacyUserDefaultsIntoPreferences(NSMutableDictionary* prefer
 // 配置写入失败通知
 NSString* const CLConfigWriteFailedNotification = @"CLConfigWriteFailedNotification";
 
+// 启动迁移期间抑制写失败通知（仅 NSLog；避免 save-failed alert）。
+// apply 在决定是否 post 时捕获本标志当前值，避免 async 主线程 block 跑时标志已清。
+static BOOL CLSuppressConfigWriteFailedNotification = NO;
+
 @interface CLSettingsStore : NSObject
 @property (nonatomic, strong) NSMutableDictionary* preferences;
 @property (nonatomic, strong) NSMutableDictionary* cachedChanges;
@@ -3161,7 +3813,7 @@ NSString* const CLConfigWriteFailedNotification = @"CLConfigWriteFailedNotificat
 + (instancetype)shared;
 - (id)readValueForKey:(NSString*)key defaultValue:(id)defaultValue;
 - (void)setValue:(id)value forKey:(NSString*)key;
-- (void)apply;
+- (BOOL)apply;
 - (void)reloadFromDisk;
 @end
 
@@ -3251,6 +3903,7 @@ static BOOL ensureStoreConfigFileExists(CLSettingsStore* store, NSString** pathO
             _isDirty = YES;
             [self apply];
         }
+        CLFileLogUpdateModeFromObject(_preferences);
     }
     return self;
 }
@@ -3354,10 +4007,10 @@ static BOOL ensureStoreConfigFileExists(CLSettingsStore* store, NSString** pathO
     }
 }
 
-- (void)apply {
+- (BOOL)apply {
     @synchronized (self) {
         if (!self.isDirty) {
-            return;
+            return YES;
         }
         NSMutableDictionary* mergedPreferences = nil;
         NSError* writeError = nil;
@@ -3371,23 +4024,45 @@ static BOOL ensureStoreConfigFileExists(CLSettingsStore* store, NSString** pathO
             NSString* attemptedPath = getConfigWritePathWithLibroot() ?: @"";
             NSArray<NSString*>* attemptedPaths = attemptedPath.length > 0 ? @[attemptedPath] : @[];
             NSLog2(@"[CL] conf write failed: attemptedPath=%@ err=%@", attemptedPath, writeError);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSMutableDictionary* userInfo = [NSMutableDictionary dictionary];
-                if (writeError) {
-                    userInfo[@"error"] = writeError;
-                }
-                if (attemptedPaths.count > 0) {
-                    userInfo[@"attemptedPaths"] = attemptedPaths;
-                } else {
-                    userInfo[@"reason"] = @"No valid write paths available";
-                }
-                userInfo[@"jbType"] = @(getJBType());
+            // 捕获当前 suppress 值：async block 可能在迁移清标志之后才跑。
+            BOOL suppressNotification = CLSuppressConfigWriteFailedNotification;
+            if (!suppressNotification) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSMutableDictionary* userInfo = [NSMutableDictionary dictionary];
+                    if (writeError) {
+                        userInfo[@"error"] = writeError;
+                    }
+                    if (attemptedPaths.count > 0) {
+                        userInfo[@"attemptedPaths"] = attemptedPaths;
+                    } else {
+                        userInfo[@"reason"] = @"No valid write paths available";
+                    }
+                    userInfo[@"jbType"] = @(getJBType());
 
-                [[NSNotificationCenter defaultCenter] postNotificationName:CLConfigWriteFailedNotification
-                                                                    object:nil
-                                                                  userInfo:userInfo];
-            });
-            return;
+                    [[NSNotificationCenter defaultCenter] postNotificationName:CLConfigWriteFailedNotification
+                                                                        object:nil
+                                                                      userInfo:userInfo];
+                });
+            }
+            // setValue 已先改 preferences；写盘失败必须回滚，保证 setlocalKVChecked
+            // 返回 NO 时内存与磁盘一致（UI 读到的不是未落盘脏值）。
+            // 失败路径允许空字典替换（与常规 reloadFromDisk 保护不同）。
+            NSString* rollbackPath = nil;
+            NSDictionary* diskDict = readConfigDictionaryFromDisk(&rollbackPath);
+            [self.preferences removeAllObjects];
+            if ([diskDict isKindOfClass:[NSDictionary class]]) {
+                [self.preferences addEntriesFromDictionary:diskDict];
+                if (rollbackPath.length > 0) {
+                    NSLog2(@"[CL] conf rolled back from disk path=%@", rollbackPath);
+                }
+            } else {
+                NSLog2(@"[CL] conf rollback: disk unreadable, cleared dirty in-memory state");
+            }
+            [self.cachedChanges removeAllObjects];
+            [self.removedKeys removeAllObjects];
+            self.isDirty = NO;
+            CLFileLogUpdateModeFromObject(self.preferences);
+            return NO;
         }
         [self.preferences removeAllObjects];
         [self.preferences addEntriesFromDictionary:mergedPreferences];
@@ -3395,6 +4070,8 @@ static BOOL ensureStoreConfigFileExists(CLSettingsStore* store, NSString** pathO
         [self.cachedChanges removeAllObjects];
         [self.removedKeys removeAllObjects];
         self.isDirty = NO;
+        CLFileLogUpdateModeFromObject(self.preferences);
+        return YES;
     }
 }
 
@@ -3417,6 +4094,7 @@ static BOOL ensureStoreConfigFileExists(CLSettingsStore* store, NSString** pathO
         [self.cachedChanges removeAllObjects];
         [self.removedKeys removeAllObjects];
         self.isDirty = NO;
+        CLFileLogUpdateModeFromObject(self.preferences);
     }
 }
 @end
@@ -3592,49 +4270,6 @@ extern "C" BOOL CLRunLocalizationPersistenceSelfTest(NSString **failureReason) {
 
     return passed;
 }
-
-extern "C" BOOL CLRunAppSettingsStoreSelfTest(NSString **failureReason) {
-    // 在临时对象上验证 CLAppSettingsStore 读写与回滚
-    NSString *tempRoot = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                          [NSString stringWithFormat:@"chargelimiter-selftest-store-%@", NSUUID.UUID.UUIDString]];
-    NSUserDefaults *tmpSuite = [[NSUserDefaults alloc] initWithSuiteName:@"com.chargelimiter.mod.appdata.selftest"];
-    CLAppSettingsStore *store = [CLAppSettingsStore shared];
-    // 注入临时 NSUserDefaults 套件覆盖 getAppUserDefaults 的返回值
-    // （利用 CLAppSettingsStore 的内部_property注入在运行测试前替换_suite返回的内容成为临时套件）
-    // 改用 setObject:forKey: 临时套件手动操作使用私有属性方式
-    if (!tmpSuite) {
-        if (failureReason) *failureReason = @"failed to create temp NSUserDefaults suite";
-        return NO;
-    }
-
-    // 写入并读回
-    [tmpSuite setInteger:0 forKey:@"AppLanguage"];
-    [tmpSuite synchronize];
-    id back = [tmpSuite objectForKey:@"AppLanguage"];
-    if (![back isKindOfClass:[NSNumber class]] || [back integerValue] != 0) {
-        if (failureReason) *failureReason = @"write/readback of AppLanguage=0 failed";
-        return NO;
-    }
-
-    [tmpSuite setInteger:1 forKey:@"AppLanguage"];
-    [tmpSuite synchronize];
-    back = [tmpSuite objectForKey:@"AppLanguage"];
-    if (![back isKindOfClass:[NSNumber class]] || [back integerValue] != 1) {
-        if (failureReason) *failureReason = @"write/readback of AppLanguage=1 failed";
-        return NO;
-    }
-
-    // 回滚还原测试
-    [tmpSuite removeObjectForKey:@"AppLanguage"];
-    [tmpSuite synchronize];
-    back = [tmpSuite objectForKey:@"AppLanguage"];
-    if (back != nil) {
-        if (failureReason) *failureReason = @"removal of AppLanguage failed";
-        return NO;
-    }
-
-    return YES;
-}
 #endif
 
 id getlocalKV(NSString* key) {
@@ -3642,9 +4277,100 @@ id getlocalKV(NSString* key) {
 }
 
 void setlocalKV(NSString* key, id val) {
+    (void)setlocalKVChecked(key, val);
+}
+
+BOOL setlocalKVChecked(NSString* key, id val) {
     CLSettingsStore* store = [CLSettingsStore shared];
     [store setValue:val forKey:key];
-    [store apply];
+    return [store apply];
+}
+
+// 把 App 四键从 appdata suite / standardUserDefaults 迁入共享 plist。
+// 权威源 = 共享 store；旧 suite 仅作迁移源。成功后写标记并 best-effort 清理 suite 四键。
+// 返回 NO 仅当「需要写入共享却写失败」；无数据可迁也返回 YES。
+// 写失败只打日志：期间设置 CLSuppressConfigWriteFailedNotification，避免 save-failed UI。
+BOOL CLMigrateAppSettingsToSharedStoreIfNeeded(void) {
+    // 必须在任何 getlocalKV / CLSettingsStore 访问之前置位：
+    // getlocalKV 会构造 shared store，init 里 legacy UserDefaults 迁移可能 apply，
+    // 而 ui 已在 migrate 前注册 save-failed observer。
+    CLSuppressConfigWriteFailedNotification = YES;
+    @try {
+        static NSString* const kMarkerKey = @"CLAppSettingsMigratedToShared";
+        static NSArray<NSString*>* keys = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            keys = @[
+                @"AppLanguage",
+                @"AppAppearance",
+                @"SliderHapticStyle",
+                @"StopChargePresetValue",
+            ];
+        });
+
+        id marker = getlocalKV(kMarkerKey);
+        if ([marker isKindOfClass:[NSNumber class]] && [marker boolValue]) {
+            return YES;
+        }
+
+        // 直接读旧 appdata suite（不再经过独立 App store）。
+        NSUserDefaults* suite = [[NSUserDefaults alloc] initWithSuiteName:@"com.chargelimiter.mod.appdata"];
+        if (suite == nil) {
+            suite = getAppUserDefaults();
+        }
+        NSUserDefaults* stdDefaults = [NSUserDefaults standardUserDefaults];
+
+        BOOL writeFailed = NO;
+        for (NSString* key in keys) {
+            id sharedVal = getlocalKV(key);
+            if ([sharedVal isKindOfClass:[NSNumber class]]) {
+                // 共享已有合法值，跳过该键
+                continue;
+            }
+
+            NSInteger val = 0;
+
+            // Priority 1: appdata suite
+            id suiteVal = [suite objectForKey:key];
+            if ([suiteVal isKindOfClass:[NSNumber class]]) {
+                val = [suiteVal integerValue];
+            } else {
+                // Priority 2: standardUserDefaults；再否则 default 0
+                id stdVal = [stdDefaults objectForKey:key];
+                if ([stdVal isKindOfClass:[NSNumber class]]) {
+                    val = [stdVal integerValue];
+                }
+            }
+
+            // 共享缺失则写入（含 default 0），保证四键在共享侧补齐
+            if (!setlocalKVChecked(key, @(val))) {
+                writeFailed = YES;
+                NSLog2(@"[CL] migrate app setting to shared failed key=%@ val=%ld", key, (long)val);
+            }
+        }
+
+        if (writeFailed) {
+            // 不写标记，下次启动可重试
+            return NO;
+        }
+
+        // 成功路径：写标记（空迁移也写，避免每启重复扫）
+        if (!setlocalKVChecked(kMarkerKey, @1)) {
+            NSLog2(@"[CL] migrate marker write failed key=%@", kMarkerKey);
+            return NO;
+        }
+
+        // best-effort 清理旧 suite 四键
+        for (NSString* key in keys) {
+            [suite removeObjectForKey:key];
+        }
+        [suite synchronize];
+
+        NSLog2(@"[CL] migrated app settings into shared plist (marker set)");
+        return YES;
+    } @finally {
+        CLSuppressConfigWriteFailedNotification = NO;
+    }
 }
 
 extern "C" void setlocalKV_C(NSString* key, id val) {

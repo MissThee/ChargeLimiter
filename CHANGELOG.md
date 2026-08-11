@@ -4,6 +4,81 @@
 
 写法参考了 Keep a Changelog 和一些成熟项目常见的结构：每个版本先说明主线，再按少量分类列出用户真正会感知到的变化，尽量详细，但不写成长文。
 
+写法参考了 Keep a Changelog 和一些成熟项目常见的结构：每个版本先说明主线，再按少量分类列出用户真正会感知到的变化，尽量详细，但不写成长文。
+
+## v1.15.0 - 2026-08-11
+
+本版两个主线：① **正式适配 relaxin 越狱（原生 roothide）**——此前部分 relaxin 设备「装好即 daemon 离线」（启动 126）、设置保存后重启丢失；本版修复 daemon 启动链路、配置持久化与 jbroot 路径兜底，并加固安装/卸载生命周期，relaxin 用户安装后即可开箱即用。② **可配置日志级别与设置入口重组**——新增「日志级别」（标准 / 仅错误），只过滤 `aldente.log` 文件输出，保留系统日志与完整诊断报告；「调试与观测」从充电高级设置移入软件设置，拆成「策略诊断 / 日志级别」两个入口。
+
+### Added
+
+- **新增「日志级别」设置**（软件设置 → 日志级别）：标准（默认）/ 仅错误两档，只过滤 `aldente.log` 文件输出，`NSLog2`/`os_log` 系统日志与完整诊断报告不受影响。
+- **「策略诊断 / 日志级别」入口移入软件设置**：「调试与观测」卡片从充电高级设置移除，改为软件设置下的「策略诊断」「日志级别」两个入口。
+
+### Fixed
+
+- **修复首页「停充预设 / 设为当前」改语言后消失**：改语言重建界面后按钮未在新行上重建，现重建时先清空旧按钮引用。
+- **修复 relaxin roothide 下 daemon 装好即离线（启动 126）**：launchd system 域在 rootfs 命名空间看不到 `/Applications` 逻辑路径，bootstrap 返回成功但 daemon 永不 exec；现 postinst 用 `jbroot` 命令把 plist `Program`/`ProgramArguments` 换成 `.jbroot-XXX` 真实路径并清理 system / user / foreground 域残留，App spawn 不再带 root persona（daemon 自身 setuid +s 提权）。
+- **修复 roothide 下 `jbroot()` 路径解析失败时日志静默空转**：不再静默早退，退用自身可执行路径推导 `.jbroot-XXX` fallback，`aldente.log` 与离线诊断在异常环境下也能正常落盘。
+- **修复 roothide 配置保存后丢失**：恢复配置路径初始化，并新增配置持久化链路诊断上报，relaxin 下设置不再静默丢失。
+- **修复 `config_reload` 失败在「仅错误」模式下被静默丢弃**：失败改以 error 级别落盘，成功保持 info。
+- **加固 Relaxin 安装与生命周期**：安装时严格解析并校验 daemon 真实路径，plist 或 launchctl 失败即中止；daemon 启动后自愈 LaunchDaemon 持久化路径；URL Scheme 避开 root persona；卸载时在 daemon 清理失败后安全删除已验证的 jbroot 数据目录。
+
+### Notes
+
+- **本版正式适配 relaxin（原生 roothide）**：relaxin 设备安装后 daemon 即可正常启动、设置修改重启不丢失；建议回归 安装 → 重启 → 卸载。
+- 「仅错误」模式下 `aldente.log` 只写 error 级；系统日志与诊断报告不受影响。
+
+## v1.14.2 - 2026-08-09
+
+本版两个主线：① 修复 daemon 在运行约半小时后崩溃（EXC_BAD_ACCESS / Segmentation fault），根因是全局 sqlite 句柄被多个线程无锁共用：http 并发队列读统计 + battery 事件写 + `reload_conf`/`app_docs` 切换关重开同一连接互相踩踏，一个线程释放连接后，另一线程在 SQL 解析/执行时读到被字符串覆写的悬垂指针，现所有 sqlite 访问统一走同一把可重入锁，HTTP 请求处理改为串行队列，并新增可复现崩溃的最小回归测试与 CI 门禁防止回潮；② 修复「永久停用系统优化充电」后无法恢复（见下方 Fixed），补齐重新打开系统的路径与 daemon 启动自愈。
+
+### Fixed
+
+- **修复 daemon 崩溃（EXC_BAD_ACCESS / SIGSEGV）**：真机反馈 daemon 运行约 27 分钟后，统计读取路径 `get_statistics -> getDBData` 在 sqlite3 内部 Segfault（故障地址指向 ASCII 字符串被当地址）。已将全部 sqlite 访问（open/prepare/step/finalize/exec/close）套上同一把可重入互斥锁，并让 HTTP 请求处理串行执行，`get_statistics` 与 `reload_conf` 关重开不再并发交叠。
+- **降低并发稳定性风险**：battery 事件写入与 HTTP 读取、以及 reload 关开连接，从源头不再同时碰同一个 sqlite 连接。
+- **修复「永久停用系统优化充电」后无法恢复**：开启「永久停用系统优化充电」会把系统的「优化电池充电」开关（`disableSmartCharging:`）写为关闭，但旧版 daemon 里没有任何路径会再把它打开，导致清配置、卸载都不一定能复原（清除/重置配置把本地 `disable_smart_charge` 清成 `NO` 后，卸载的复位逻辑会直接跳过）。现补齐三条重新打开系统的路径 + daemon 启动自愈：① 清配置/重置时把 `disable_smart_charge` 一并还原为 `NO`；② 关闭「永久停用」开关（`set_conf`）时立即 `setSmartChargeEnable(YES)`；③ 清除配置（`reset_conf`）后若系统仍关闭则显式恢复；④ daemon 启动时若配置已放行但系统优化充电仍处于关闭态则自动恢复——让已受影响的设备装新版后无需任何手动操作即可复原。
+
+### Added
+
+- **sqlite 并发竞态回归测试**：`tests/sqlite_race_repro.c` 用纯 C 镜像 daemon 的 sqlite 访问与线程模型，无锁变体在 ASan / TSan / 裸跑均能复现同类 Segfault，加锁变体在 sanitizer 下干净；`tests/run_repro.sh` 一键构建运行。
+- **CI 回归门禁**：新增 `sqlite-race-repro` workflow，在 daemon / HTTP 服务器 / 测试相关文件变更时自动校验「加锁修复在 sanitizer 下保持干净」，防止竞态回潮。
+- **relaxin roothide daemon 离线自愈与可观测化**：针对部分 relaxin 越狱 roothide 设备上「装好即 daemon 离线」的问题，新增「修复 daemon 启动」入口（后台 kill 残留 → 重新拉起 daemon → 尽力而为的 launchctl 复位 → 回读日志），一键将 daemon 拉回在线；完整诊断报告新增「daemon 启动链路（离线诊断）」段与越狱类型双源判读，离线即可定位失败环节（spawn rc / 端口 / launchctl / 日志尾）。
+
+### Notes
+
+- 本版无用户侧功能/配置变化；重点回归方向是在装有新构建后打开统计页拉取 `get_statistics`，同时触发一次 `reload_conf`（旧版迁移提示）或 App 更新后首次请求，观察 30 分钟以上确认无崩溃。
+
+## v1.14.1 - 2026-08-07
+
+本版主线是 **策略诊断可复制给开发者** 与 **原生 roothide 构建链路**：在「充电高级 → 策略诊断」提供一键完整诊断（环境 / 连通性 / 读电量 IOKit 链路 / 策略信号），并默认用原生 roothide scheme 出包；同时补强诊断字段，避免 roothide 误报与路径空白。
+
+### Added
+
+- **一键复制完整诊断**（充电高级 → 策略诊断）：复制 Markdown 分段报告，含环境、daemon 连通性、读电量 service/关键 key、策略信号；daemon 离线时仍可复制并带 `⚠️ daemon 离线` 横幅，便于区分「daemon 没起来」与「IOKit 读不到电量」。
+- **环境与连通性卡片**：诊断页实时展示包架构、越狱类型、daemon 在线/HTTP、命中 service、`CurrentCapacity` 是否齐全等，进页自动拉取。
+- **daemon 只读 `get_diag` API**：上报命中 service、发布 key 清单、五关键 key 存在性、IOKit 返回值、`use_smart`、越狱类型、路径与即时电量/电流等，无写盘/不停充副作用。
+- **原生 roothide 打包路径**：默认 `ChargeLimiter roothide` scheme + `Package_roothide` 出 `iphoneos-arm64e` deb（可用 `--legacy-roothide-convert` / `--skip-roothide` 切换）。
+
+### Fixed
+
+- **修复构建链接失败 `Undefined symbols: CLDiagnosticCollector`**：将诊断采集源码接入三个 App target（rootful/rootless/roothide），Daemon 不链接；并为 roothide/rootless App 增加 `CL_PACKAGE_ROOTHIDE` / `CL_PACKAGE_ROOTLESS` 宏。
+- **修复完整诊断中可执行路径/数据根路径常为「无法获取」**：App 在 `dlsym` 失败时用 dyld/`NSBundle`/Documents 兜底；daemon `get_diag` 回传 `exe_path` / `data_root` 作为权威补充。
+- **修复 roothide 下 `libjailbreak.dylib ❌dlopen失败` 误导**：真实 `/usr/lib` 无该库时改为「N/A（roothide 预期）」，避免当成越狱损坏。
+- **修复诊断页导出入口易混淆**：复制探针/策略/事件时间线按钮改名并加说明；移除与诊断无关的「复制长测校准模板」入口。
+
+### Changed
+
+- 完整诊断读电量段增加 **当前电量/电流** 一行；复制文本末尾增加 **使用说明**（查电量直接复制；查停充请先插电并运行探针后再复制）。
+- 策略诊断页 tip 文案同步说明查电量 vs 查停充流程。
+- roothide 正式发布线改为原生构建；本地 libroot 由脚本/CI 填充，不再依赖误提交的本地 stub。
+
+### Notes
+
+- **若完整诊断显示 daemon 离线 / Could not connect to the server**：属于 LaunchDaemon 或进程未监听 `127.0.0.1:1230`，不是 iOS 17 读电量 key 未适配。请在 jbroot shell 检查 `launchctl` 与前台运行 `ChargeLimiterDaemon`（详见排障说明）。
+- 回归建议：roothide 安装后打开策略诊断 → 一键复制，确认路径非空、库状态文案合理；daemon 在线机确认 service/key/电量行有数；`./scripts/build_packages.sh` 能产出 tipa + 三份 deb。
+- 适用于 rootful / rootless / roothide / TrollStore；roothide 用户请安装 `ChargeLimiter_*_roothide_arm64e.deb`。
+
 ## v1.14.0 - 2026-08-06
 
 本版主要解决了 roothide（iOS 17）环境下充电控制失效与 App 语言/设置重启后丢失两大问题：新增 iOS 17 停充写法探针并落地了专用的 override 充电控制平面，同时把 App 专属设置抽离到独立 store 彻底修复重启丢失。

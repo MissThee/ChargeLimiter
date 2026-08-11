@@ -11,7 +11,6 @@
 #import <objc/message.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import "CLLocalization.h"
-#import "UIKit/CLAppSettingsStore.h"
 
 // UIKit 原生界面
 #define USE_NATIVE_UIKIT 1
@@ -105,10 +104,10 @@ static AppDelegate* _app = nil;
                                                  name:CLConfigWriteFailedNotification
                                                object:nil];
 
-    // 首次启动时从共享 plist / standardUserDefaults 迁移 App 设置到 appdata suite
-    NSError *migrateError = nil;
-    if (![[CLAppSettingsStore shared] migrateIfNeeded:&migrateError]) {
-        NSLog2(@"[CL] AppSettingsStore migration skipped or incomplete: %@", migrateError);
+    // 首次启动：把 appdata suite / standardUserDefaults 中的 App 四键迁入共享 plist
+    // 失败只打日志，不弹「保存失败」（避免与用户主动改设置的写失败反馈混淆）
+    if (!CLMigrateAppSettingsToSharedStoreIfNeeded()) {
+        NSLog2(@"[CL] shared settings migration had write failures");
     }
 
     CLApplyLanguageFromSettings();
@@ -226,9 +225,10 @@ static AppDelegate* _app = nil;
                 if (window) {
                     window.rootViewController = mainVC;
                     [window makeKeyAndVisible];
-                    // 从持久存储读取并应用深色模式设置(AppAppearance: 0=跟随系统,1=浅色,2=深色)
+                    // 从共享 plist 读取并应用深色模式设置(AppAppearance: 0=跟随系统,1=浅色,2=深色)
                     if (@available(iOS 13.0, *)) {
-                        NSInteger appearance = [[CLAppSettingsStore shared] integerForKey:@"AppAppearance" defaultValue:0];
+                        id appearanceVal = getlocalKV(@"AppAppearance");
+                        NSInteger appearance = [appearanceVal isKindOfClass:[NSNumber class]] ? [appearanceVal integerValue] : 0;
                         window.overrideUserInterfaceStyle = (UIUserInterfaceStyle)appearance;
                     }
                 } else {
@@ -520,7 +520,7 @@ void daemonRun(NSArray* argv) {
         [mArgv addObjectsFromArray:argv];
     }
     int spawnFlags = SPAWN_FLAG_NOWAIT;
-    if (g_jbtype != JBTYPE_TROLLSTORE) {
+    if (g_jbtype != JBTYPE_TROLLSTORE && g_jbtype != JBTYPE_ROOTHIDE) {
         spawnFlags |= SPAWN_FLAG_ROOT;
     }
     spawn(mArgv, nil, nil, 0, spawnFlags);

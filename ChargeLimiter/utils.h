@@ -48,7 +48,10 @@ enum {
     JBTYPE_TROLLSTORE   = 8, // TrollStore/AppStore
 };
 int getJBType();
+// 1=updated, 0=unchanged/not applicable, -1=failed.
+int CLRepairRoothideLaunchDaemonPlist(void);
 void NSFileErrorLog(NSString* fmt, ...);
+void NSFileInfoLog(NSString* fmt, ...);
 NSString* getAppVer();
 NSString* getSysVer();
 NSOperatingSystemVersion getSysVerInt();
@@ -85,6 +88,10 @@ void setSmartChargeEnable(BOOL flag);
 /* ---------------- App ---------------- */
 id getlocalKV(NSString* key);
 void setlocalKV(NSString* key, id val);
+BOOL setlocalKVChecked(NSString* key, id val); // YES=写盘成功
+// 启动时把 App 四键从 appdata suite / standardUserDefaults 迁入共享 plist。
+// YES=迁移逻辑完成（含无数据可迁）；NO=需要写入共享却写失败。
+BOOL CLMigrateAppSettingsToSharedStoreIfNeeded(void);
 NSDictionary* getAllKV();
 BOOL getLocalBool(NSString* key, BOOL defaultValue);
 int getLocalInt(NSString* key, int defaultValue);
@@ -120,6 +127,11 @@ extern "C" int cleanupAppDataContainer_C(void);
 extern "C" NSString* getConfPath_C(void);
 extern "C" NSString* getConfDirPath_C(void);
 extern "C" NSString* getRuntimeDataRootPath_C(void);
+extern "C" NSDictionary* getConfigPersistenceDiagnostics_C(void);
+// Thin C-linkage wrappers for App-side dlsym (utils.mm symbols are C++ mangled).
+extern "C" int getJBType_C(void);
+extern "C" NSString* getSelfExePath_C(void);
+extern "C" int get_sys_boottime_C(void);
 extern "C" void setlocalKV_C(NSString* key, id val);
 extern "C" id getlocalKV_C(NSString* key);
 extern "C" void reloadLocalKVFromDisk_C(void);

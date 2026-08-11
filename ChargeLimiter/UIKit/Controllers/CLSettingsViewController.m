@@ -9,10 +9,10 @@
 #import "../CLBatteryManager.h"
 #import "../CLAPIClient.h"
 #import "../CLSymbolImageSupport.h"
-#import "../CLAppSettingsStore.h"
 #import "../../CLLocalization.h"
 // 写失败通知在 utils.mm 中定义/广播，这里前向声明即可拿到符号，
 // 避免把整个 utils.h 拖进来（utils.h 含大量 daemon 侧声明，不适配 UIKit target）。
+// App 四键权威源 = 共享 plist（getlocalKV_C / setlocalKV_C）；apply 失败会 post 通知，勿在此再 post。
 extern NSString* const CLConfigWriteFailedNotification;
 NSUserDefaults* getAppUserDefaults(void);
 NSString* getAppDocumentsPath_C(void);
@@ -1671,6 +1671,8 @@ static NSString *CLHistoryEventTimestampLabel(NSTimeInterval timestamp) {
 @property (nonatomic, assign) NSInteger policyEventFilterIndex;
 @property (nonatomic, assign) BOOL showAmperage;
 @property (nonatomic, assign) BOOL showVoltage;
+// 事件卡片渲染缓存：记录上次渲染对应的 (segment 维度, 时间范围, 过滤, 取值开关)，未变时跳过重建
+@property (nonatomic, strong) NSString *eventCardRenderSignature;
 @property (nonatomic, strong) NSTimer *refreshTimer;
 @property (nonatomic, assign) NSInteger offsetMin5;
 @property (nonatomic, assign) NSInteger offsetHour;
@@ -2132,6 +2134,8 @@ static NSString *CLHistoryEventTimestampLabel(NSTimeInterval timestamp) {
             weakSelf.policyEventHistory = [weakSelf appendPolicyEvents:weakSelf.policyEventHistory withNew:eventHistory];
         }
         weakSelf.policyEventLastID = [weakSelf lastPolicyEventID];
+        // 数据变化后使事件卡片签名缓存失效，确保时间窗内新到的策略事件能被重建渲染出来
+        weakSelf.eventCardRenderSignature = nil;
         [weakSelf rebuildPolicyEventCardForCurrentSelection];
     }];
 }
@@ -2156,6 +2160,13 @@ static NSString *CLHistoryEventTimestampLabel(NSTimeInterval timestamp) {
             continue;
         }
         [merged addObject:item];
+    }
+    // 与服务端 policy_events DB 上限一致，避免 UI 侧镜像无限增长：
+    // 镜像过大时每次切维度都全量遍历 + 整卡重建，是历史统计页卡死的放大器。
+    NSUInteger cap = 5000;
+    if (merged.count > cap) {
+        NSRange keep = NSMakeRange(merged.count - cap, cap);
+        merged = [[merged subarrayWithRange:keep] mutableCopy];
     }
     return merged;
 }
@@ -2497,6 +2508,20 @@ static NSString *CLHistoryEventTimestampLabel(NSTimeInterval timestamp) {
     if (self.eventCard == nil) {
         return;
     }
+
+    // 变化签名：segment 维度 + 可见时间范围 + 过滤 + 数据源是否相同。
+    // 快速点击“同维度/同页/同过滤”时内容未变，跳过整卡重建，避免反复销毁重建一堆视图 + 整页重布局。
+    NSTimeInterval visStart = [visible.firstObject[@"UpdateTime"] doubleValue];
+    NSTimeInterval visEnd   = [visible.lastObject[@"UpdateTime"] doubleValue];
+    NSString *signature = [NSString stringWithFormat:@"%ld|%.0f|%.0f|%ld|%d|%d",
+                           (long)segment, floor(visStart), floor(visEnd),
+                           (long)self.policyEventFilterIndex,
+                           self.showAmperage, self.showVoltage];
+    if ([self.eventCardRenderSignature isEqualToString:signature]) {
+        return;
+    }
+    self.eventCardRenderSignature = signature;
+
     for (UIView *view in self.eventCard.contentStack.arrangedSubviews) {
         [self.eventCard.contentStack removeArrangedSubview:view];
         [view removeFromSuperview];
@@ -2533,14 +2558,17 @@ static NSString *CLHistoryEventTimestampLabel(NSTimeInterval timestamp) {
         return;
     }
 
+    // 渲染封顶：最多展示时间窗内最近 kPolicyEventCardMaxRows 条，避免事件多时一次点击创建几十上百个行视图 + 约束。
+    const NSUInteger kPolicyEventCardMaxRows = 8;
+    NSUInteger renderCount = MIN(events.count, kPolicyEventCardMaxRows);
     [self.eventCard addSeparator];
-    for (NSUInteger i = 0; i < events.count; i++) {
+    for (NSUInteger i = 0; i < renderCount; i++) {
         UIView *row = [self policyEventRowWithItem:events[i]];
         if (i % 2 == 1) {
             row.backgroundColor = [[UIColor secondarySystemGroupedBackgroundColor] colorWithAlphaComponent:0.5];
         }
         [self.eventCard.contentStack addArrangedSubview:row];
-        if (i < events.count - 1) {
+        if (i < renderCount - 1) {
             [self.eventCard addSeparator];
         }
     }
@@ -4305,21 +4333,18 @@ static NSString *CLDaemonLanguageValueForLocaleIdentifier(NSString *identifier) 
 
 static NSString * const CLStopChargePresetDefaultsKey = @"StopChargePresetValue";
 
-// App 专属设置统一走 CLAppSettingsStore（NSUserDefaults suite com.chargelimiter.mod.appdata），
-// 与 root daemon 的共享 plist 物理隔离；roothide 下 mobile 进程可读写，重启/重新越狱后不丢失。
-// 写失败时发送 CLConfigWriteFailedNotification，由 AppDelegate 弹出失败提示并去重。
+// App 四键走共享 plist（getlocalKV_C / setlocalKV_C → CLSettingsStore）。
+// setlocalKV_C 内部 apply 失败时已 post CLConfigWriteFailedNotification，此处不要再 post 一次。
 static NSInteger CLLocalIntegerForKey(NSString *key, NSInteger defaultValue) {
-    return [[CLAppSettingsStore shared] integerForKey:key defaultValue:defaultValue];
+    id val = getlocalKV_C(key);
+    if ([val isKindOfClass:[NSNumber class]]) {
+        return [val integerValue];
+    }
+    return defaultValue;
 }
 
 static void CLSetLocalIntegerForKey(NSString *key, NSInteger value) {
-    NSError *error = nil;
-    if (![[CLAppSettingsStore shared] setIntegerForKey:key value:value error:&error]) {
-        [[NSNotificationCenter defaultCenter] postNotificationName:CLConfigWriteFailedNotification
-                                                            object:nil
-                                                          userInfo:@{@"key": key,
-                                                                     @"error": error ?: [NSNull null]}];
-    }
+    setlocalKV_C(key, @(value));
 }
 
 static NSInteger CLNormalizedStopChargePresetValue(NSInteger value) {
@@ -4445,6 +4470,9 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
 - (void)syncDaemonLanguageWithAppLanguage:(CLAppLanguage)language;
 - (void)promptLegacyResidualCleanupWithPaths:(NSArray<NSString *> *)paths completion:(dispatch_block_t)completion;
 - (void)showLegacyResidualCleanupResult:(NSDictionary *)result;
+- (NSString *)softwareLogLevelText;
+- (void)softwareLogLevelTapped:(UITapGestureRecognizer *)tap;
+- (void)softwarePolicyDiagnosticsTapped;
 @end
 
 @implementation CLSoftwareSettingsViewController
@@ -4455,6 +4483,11 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     self.title = CLL(@"软件设置");
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
     [self setupUI];
+    // 日志级别：旧版本未设置时默认 normal
+    NSString *logLevel = getlocalKV_C(@"log_level");
+    if (!logLevel || logLevel.length == 0) {
+        [[CLAPIClient shared] setConfigWithKey:@"log_level" value:@"normal" completion:nil];
+    }
     [self syncDaemonLanguageWithAppLanguage:CLGetAppLanguage()];
     
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -4529,6 +4562,10 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
     [self.settingsCard addNavigationRowWithIcon:@"moon.fill" title:CLL(@"深色模式") value:[self appearanceValueLabel] color:[UIColor systemGrayColor] target:self action:@selector(darkModeTapped)];
     [self.settingsCard addSeparator];
     [self.settingsCard addNavigationRowWithIcon:@"tag.fill" title:CLL(@"停充预设") value:[self chargeAbovePresetValueLabel] color:CLStopChargePresetAccentColor() target:self action:@selector(stopChargePresetTapped)];
+    [self.settingsCard addSeparator];
+    [self.settingsCard addNavigationRowWithIcon:@"waveform.path.ecg" title:CLL(@"策略诊断") value:CLL(@"查看") color:[UIColor systemTealColor] target:self action:@selector(softwarePolicyDiagnosticsTapped)];
+    [self.settingsCard addSeparator];
+    [self.settingsCard addNavigationRowWithIcon:@"doc.text" title:CLL(@"日志级别") value:self.softwareLogLevelText color:[UIColor systemPurpleColor] target:self action:@selector(softwareLogLevelTapped:)];
     [self.settingsCard addSeparator];
     [self.settingsCard.contentStack addArrangedSubview:[self buildHapticRow]];
     [self.settingsCard addSeparator];
@@ -4623,12 +4660,10 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
         NSError *error = nil;
         if (CLSetAppLanguage(language, &error)) {
             [self syncDaemonLanguageWithAppLanguage:language];
-        } else {
-            [[NSNotificationCenter defaultCenter] postNotificationName:CLConfigWriteFailedNotification
-                                                                object:nil
-                                                              userInfo:@{@"key": @"AppLanguage",
-                                                                         @"error": error ?: [NSNull null]}];
         }
+        // 写失败：setlocalKVChecked/apply 已 post CLConfigWriteFailedNotification，勿双重弹窗。
+        // error 仅用于调试；UI 合法入口不会触发 range 校验失败。
+        (void)error;
     };
 
     [alert addAction:[self checkedActionWithTitle:CLL(@"跟随系统") checked:(current == CLAppLanguageSystem) handler:^(UIAlertAction * _Nonnull action) {
@@ -5165,6 +5200,45 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
                                      : [[UIColor secondaryLabelColor] colorWithAlphaComponent:0.7];
     }
     [self updateCardValue:self.settingsCard title:CLL(@"停充预设") value:[self chargeAbovePresetValueLabel]];
+    [self updateCardValue:self.settingsCard title:CLL(@"日志级别") value:self.softwareLogLevelText];
+}
+
+- (NSString *)softwareLogLevelText {
+    NSString *level = getlocalKV_C(@"log_level");
+    if ([level isEqualToString:@"error"]) {
+        return CLL(@"仅错误");
+    }
+    return CLL(@"标准");
+}
+
+- (void)softwareLogLevelTapped:(UITapGestureRecognizer *)tap {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:CLL(@"日志级别") message:nil preferredStyle:UIAlertControllerStyleAlert];
+
+    __weak typeof(self) weakSelf = self;
+    UIAlertAction *normalAction = [UIAlertAction actionWithTitle:CLL(@"标准") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [[CLAPIClient shared] setConfigWithKey:@"log_level" value:@"normal" completion:^(NSDictionary * _Nullable res, NSError * _Nullable err) {
+            [weakSelf updateCardValue:weakSelf.settingsCard title:CLL(@"日志级别") value:weakSelf.softwareLogLevelText];
+        }];
+    }];
+    [alert addAction:normalAction];
+
+    UIAlertAction *errorAction = [UIAlertAction actionWithTitle:CLL(@"仅错误") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [[CLAPIClient shared] setConfigWithKey:@"log_level" value:@"error" completion:^(NSDictionary * _Nullable res, NSError * _Nullable err) {
+            [weakSelf updateCardValue:weakSelf.settingsCard title:CLL(@"日志级别") value:weakSelf.softwareLogLevelText];
+        }];
+    }];
+    [alert addAction:errorAction];
+
+    [alert addAction:[UIAlertAction actionWithTitle:CLL(@"取消") style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)softwarePolicyDiagnosticsTapped {
+    Class cls = NSClassFromString(@"CLPolicyDiagnosticsViewController");
+    UIViewController *vc = [[cls alloc] init];
+    if (vc) {
+        [self.navigationController pushViewController:vc animated:YES];
+    }
 }
 
 - (UISwitch *)switchInCard:(CLGlassCard *)card tag:(NSInteger)tag {
@@ -5672,9 +5746,14 @@ static void CLPresentStopChargePresetEditor(UIViewController *presenter,
 - (void)setupLimitCard {
     self.limitCard = [[CLGlassCard alloc] init];
     self.limitCard.viewController = self;
-    
+
+    // 语言切换等触发重建时，旧按钮已随旧视图移除；
+    // 若不先清空，attach 的防重 guard 会误判为“已存在”而早退，导致新行上按钮丢失。
+    self.chargeAbovePresetButton = nil;
+    self.setChargeAboveCurrentButton = nil;
+
     __weak typeof(self) weakSelf = self;
-    
+
     // 停止充电滑块 - 保存引用以便更新
     self.chargeAboveRow = [self.limitCard addSliderRowWithTitle:CLL(@"停止充电 (电量 ≥)") value:self.chargeAbove minValue:15 maxValue:100 color:[UIColor systemGreenColor] tag:201 onChange:^(NSInteger value) {
         NSInteger adjustedAbove = value;

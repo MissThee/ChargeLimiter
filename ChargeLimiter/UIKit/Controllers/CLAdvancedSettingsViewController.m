@@ -9,8 +9,60 @@
 #import "../CLBatteryManager.h"
 #import "../CLAPIClient.h"
 #import "../CLSymbolImageSupport.h"
+#import "../CLDiagnosticCollector.h"
 #import "../../CLLocalization.h"
 #import <objc/runtime.h>
+
+extern NSDictionary *clRepairDaemonForApp_C(void);
+
+id getlocalKV_C(NSString* key);
+void setlocalKV_C(NSString* key, id val);
+
+static char kCLDaemonRepairRunningKey;
+static BOOL CLDaemonRepairRunning(id self) {
+    return [objc_getAssociatedObject(self, &kCLDaemonRepairRunningKey) boolValue];
+}
+static void CLSetDaemonRepairRunning(id self, BOOL running) {
+    objc_setAssociatedObject(self, &kCLDaemonRepairRunningKey, @(running), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static NSString *CLRedactJBRootTokens(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+        return @"";
+    }
+    NSError *error = nil;
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\\.jbroot-[^/\\s]+"
+                                                                           options:0
+                                                                             error:&error];
+    if (!regex || error) {
+        return text;
+    }
+    return [regex stringByReplacingMatchesInString:text
+                                           options:0
+                                             range:NSMakeRange(0, text.length)
+                                      withTemplate:@".jbroot-…"];
+}
+
+static NSString *CLSanitizeLaunchctlPrintOutput(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+        return @"";
+    }
+    NSArray<NSString *> *allowedKeys = @[
+        @"state", @"path", @"program", @"pid", @"runs", @"last exit code", @"reason"
+    ];
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    for (NSString *rawLine in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        NSString *line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSString *lowercase = line.lowercaseString;
+        for (NSString *key in allowedKeys) {
+            if ([lowercase hasPrefix:[key stringByAppendingString:@" ="]]) {
+                [kept addObject:CLRedactJBRootTokens(line)];
+                break;
+            }
+        }
+    }
+    return [kept componentsJoinedByString:@" ⏎ "];
+}
 
 #pragma mark - 毛玻璃卡片（复用）
 
@@ -521,6 +573,9 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
 @property (nonatomic, copy) NSString *lastProbeSummaryText;
 @property (nonatomic, copy) NSDictionary *lastProbePayload;
 @property (nonatomic, strong) UILabel *probeResultLabel;
+@property (nonatomic, strong, nullable) CLDiagnosticReport *lastDiagReport;
+@property (nonatomic, copy, nullable) NSDictionary *lastRepairResult;
+@property (nonatomic, strong, nullable) CLAdvSettingsCard *repairCard;
 @end
 
 @implementation CLPolicyDiagnosticsViewController
@@ -563,6 +618,7 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self updateDiagnosticValues];
+    [self refreshEnvironmentDiagnostics];
 }
 
 - (void)dealloc {
@@ -613,6 +669,53 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
 
 - (void)setupContent {
     [self.valueLabels removeAllObjects];
+
+    // —— 主入口:一键复制完整诊断 ——
+    CLAdvSettingsCard *copyAllCard = [[CLAdvSettingsCard alloc] init];
+    self.repairCard = copyAllCard;
+    [copyAllCard addPickerRowWithIcon:@"doc.on.doc.fill"
+                                title:CLL(@"一键复制完整诊断")
+                                value:CLL(@"复制")
+                                color:[UIColor systemBlueColor]
+                                  tag:920
+                               target:self
+                               action:@selector(copyFullDiagnosticTapped:)];
+    [copyAllCard addSeparator];
+    [copyAllCard addPickerRowWithIcon:@"arrow.clockwise.circle"
+                                title:CLL(@"修复 daemon 启动") value:CLL(@"修复")
+                                color:[UIColor systemOrangeColor] tag:926
+                               target:self action:@selector(repairDaemonTapped)];
+    [self addTipRowToCard:copyAllCard text:CLL(@"查电量/连通性可直接复制。查停充请先插电并运行探针后再复制。")];
+    [self.mainStack addArrangedSubview:copyAllCard];
+
+    // —— 环境与连通性 ——
+    CLAdvSettingsCard *envCard = [[CLAdvSettingsCard alloc] init];
+    [envCard addSectionHeader:CLL(@"环境与连通性")];
+    [self addDiagnosticRowToCard:envCard key:@"diag_device" icon:@"iphone" title:CLL(@"设备") color:[UIColor systemGrayColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_ios" icon:@"gear" title:CLL(@"系统版本") color:[UIColor systemGrayColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_appver" icon:@"app.badge" title:CLL(@"应用版本") color:[UIColor systemGrayColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_scheme" icon:@"shippingbox" title:CLL(@"包架构") color:[UIColor systemGrayColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_jbtype" icon:@"lock.shield" title:CLL(@"越狱类型") color:[UIColor systemGrayColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_daemon" icon:@"server.rack" title:CLL(@"守护进程") color:[UIColor systemGrayColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_http" icon:@"network" title:CLL(@"HTTP 可达") color:[UIColor systemGrayColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_uptime" icon:@"clock" title:CLL(@"daemon 启动时长") color:[UIColor systemGrayColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_service" icon:@"cpu" title:CLL(@"命中 service") color:[UIColor systemTealColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_key_count" icon:@"list.number" title:CLL(@"发布 key 数") color:[UIColor systemTealColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_key_capacity" icon:@"battery.50" title:CLL(@"CurrentCapacity 齐全") color:[UIColor systemTealColor]];
+    [envCard addSeparator];
+    [self addDiagnosticRowToCard:envCard key:@"diag_iokit" icon:@"wrench" title:CLL(@"IOKit 返回值") color:[UIColor systemTealColor]];
+    [self addTipRowToCard:envCard text:CLL(@"上方按钮复制完整诊断（环境+连通性+读电量+策略）。roothide 下 libjailbreak 失败多为预期。")];
+    [self.mainStack addArrangedSubview:envCard];
 
     CLAdvSettingsCard *runtimeCard = [[CLAdvSettingsCard alloc] init];
     [runtimeCard addSectionHeader:CLL(@"策略运行时")];
@@ -704,7 +807,7 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
                              action:@selector(runChargeControlProbeTapped:)];
     [probeCard addSeparator];
     [probeCard addPickerRowWithIcon:@"doc.on.doc"
-                              title:CLL(@"复制探针结果")
+                              title:CLL(@"复制探针→详细")
                               value:CLL(@"复制")
                               color:[UIColor systemBlueColor]
                                 tag:911
@@ -715,6 +818,7 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
                                                     value:CLL(@"尚未运行")
                                                     color:[UIColor systemGrayColor]];
     self.probeResultLabel = probeResult;
+    [self addTipRowToCard:probeCard text:CLL(@"仅含探针结论,不含环境")];
     [self addTipRowToCard:probeCard
                      text:CLL(@"建议插电后运行。将短暂尝试停充并自动恢复，用于确认 iOS 控制面是否真正生效。")];
     UIView *probeTipRow = probeCard.contentStack.arrangedSubviews.lastObject;
@@ -729,12 +833,11 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
 
     CLAdvSettingsCard *exportCard = [[CLAdvSettingsCard alloc] init];
     [exportCard addSectionHeader:CLL(@"导出与校准")];
-    [exportCard addPickerRowWithIcon:@"doc.on.doc" title:CLL(@"复制诊断摘要") value:CLL(@"复制") color:[UIColor systemBlueColor] tag:900 target:self action:@selector(copyDiagnosticSummaryTapped:)];
+    [exportCard addPickerRowWithIcon:@"doc.on.doc" title:CLL(@"复制策略信号") value:CLL(@"复制") color:[UIColor systemBlueColor] tag:900 target:self action:@selector(copyDiagnosticSummaryTapped:)];
+    [self addTipRowToCard:exportCard text:CLL(@"仅含策略/保持/信号,不含环境")];
     [exportCard addSeparator];
-    [exportCard addPickerRowWithIcon:@"square.and.arrow.up" title:CLL(@"导出事件时间线") value:CLL(@"导出") color:[UIColor systemBlueColor] tag:901 target:self action:@selector(exportPolicyEventTimelineTapped:)];
-    [exportCard addSeparator];
-    [exportCard addPickerRowWithIcon:@"list.bullet.rectangle" title:CLL(@"复制长测校准模板") value:CLL(@"复制") color:[UIColor systemBlueColor] tag:902 target:self action:@selector(copyCalibrationChecklistTapped:)];
-    [self addTipRowToCard:exportCard text:CLL(@"可导出当前关键状态、最近长时间事件，以及真机长测与阈值校准模板。")];
+    [exportCard addPickerRowWithIcon:@"square.and.arrow.up" title:CLL(@"导出事件时间线→原始") value:CLL(@"导出") color:[UIColor systemBlueColor] tag:901 target:self action:@selector(exportPolicyEventTimelineTapped:)];
+    [self addTipRowToCard:exportCard text:CLL(@"仅含持久化事件,不含环境")];
     [self.mainStack addArrangedSubview:exportCard];
 
     [self updateDiagnosticValues];
@@ -1293,6 +1396,234 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
     [self presentInfoAlertWithTitle:CLL(@"已复制") message:CLL(@"真机长测与校准模板已复制到剪贴板。")];
 }
 
+- (void)refreshEnvironmentDiagnostics {
+    NSString *policy = [self diagnosticSummaryTextForManager:[CLBatteryManager shared]];
+    NSString *probe = self.lastProbeSummaryText;
+    NSString *repair = [self repairSummaryTextForResult:self.lastRepairResult];
+    __weak typeof(self) weakSelf = self;
+    [CLDiagnosticCollector collectWithPolicySummary:policy
+                                      probeSummary:probe
+                                     repairSummary:repair
+                                        completion:^(CLDiagnosticReport *report) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        self.lastDiagReport = report;
+        [self applyDiagReportToLabels:report];
+    }];
+}
+
+- (void)applyDiagReportToLabels:(CLDiagnosticReport *)report {
+    CLDiagEnvironment *e = report.environment;
+    CLDiagConnectivity *c = report.connectivity;
+    CLDiagBatteryProbe *b = report.batteryProbe;
+    [self updateDiagnosticValue:(e.deviceModel.length ? e.deviceModel : @"--") forKey:@"diag_device"];
+    [self updateDiagnosticValue:(e.systemVersion.length ? e.systemVersion : @"--") forKey:@"diag_ios"];
+    [self updateDiagnosticValue:(e.appVersion.length ? e.appVersion : @"--") forKey:@"diag_appver"];
+    [self updateDiagnosticValue:(e.packageScheme.length ? e.packageScheme : @"--") forKey:@"diag_scheme"];
+    [self updateDiagnosticValue:(e.jbType.length ? e.jbType : @"--") forKey:@"diag_jbtype"];
+    [self updateDiagnosticValue:(c.daemonAlive ? @"YES" : @"NO") forKey:@"diag_daemon"];
+    [self updateDiagnosticValue:(c.httpReachable ? @"YES" : @"NO") forKey:@"diag_http"];
+    [self updateDiagnosticValue:(c.daemonUptimeText.length ? c.daemonUptimeText : @"N/A") forKey:@"diag_uptime"];
+    [self updateDiagnosticValue:(b.serviceName.length ? b.serviceName : @"--") forKey:@"diag_service"];
+    [self updateDiagnosticValue:[NSString stringWithFormat:@"%lu", (unsigned long)b.publishedKeys.count] forKey:@"diag_key_count"];
+    BOOL capOK = [b.keyPresent[@"CurrentCapacity"] boolValue];
+    [self updateDiagnosticValue:(c.httpReachable ? (capOK ? @"YES" : @"❌缺失") : @"--") forKey:@"diag_key_capacity"];
+    [self updateDiagnosticValue:(c.httpReachable ? [NSString stringWithFormat:@"%ld", (long)b.iokitReturn] : @"--") forKey:@"diag_iokit"];
+}
+
+- (void)copyFullDiagnosticTapped:(UITapGestureRecognizer *)tap {
+    NSString *policy = [self diagnosticSummaryTextForManager:[CLBatteryManager shared]];
+    NSString *probe = self.lastProbeSummaryText;
+    NSString *repair = [self repairSummaryTextForResult:self.lastRepairResult];
+    __weak typeof(self) weakSelf = self;
+    [CLDiagnosticCollector collectWithPolicySummary:policy
+                                      probeSummary:probe
+                                     repairSummary:repair
+                                        completion:^(CLDiagnosticReport *report) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        self.lastDiagReport = report;
+        [self applyDiagReportToLabels:report];
+        NSString *text = [report markdownText] ?: @"";
+        [UIPasteboard generalPasteboard].string = text;
+        [self presentInfoAlertWithTitle:CLL(@"已复制") message:CLL(@"完整诊断已复制到剪贴板。")];
+    }];
+}
+
+- (void)repairDaemonTapped {
+    if (CLDaemonRepairRunning(self)) {
+        return;
+    }
+    CLSetDaemonRepairRunning(self, YES);
+    [self setRepairButtonEnabled:NO];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSDictionary *result = clRepairDaemonForApp_C() ?: @{};
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) {
+                return;
+            }
+            CLSetDaemonRepairRunning(self, NO);
+            [self setRepairButtonEnabled:YES];
+            [self handleDaemonRepairResult:result];
+        });
+    });
+}
+
+// 修复运行中禁点修复按钮（视觉反馈）
+- (void)setRepairButtonEnabled:(BOOL)enabled {
+    UIView *row = [self copyRepairRow];
+    if (!row) {
+        return;
+    }
+    row.userInteractionEnabled = enabled;
+    row.alpha = enabled ? 1.0 : 0.5;
+    for (UIView *sub in row.subviews) {
+        sub.alpha = enabled ? 1.0 : 0.5;
+    }
+}
+
+// 在当前 repair 卡上定位「修复 daemon 启动」行（tag 926）
+- (UIView *)copyRepairRow {
+    for (UIView *v in self.repairCard.contentStack.arrangedSubviews) {
+        if (v.tag == 926) {
+            return v;
+        }
+    }
+    return nil;
+}
+
+- (void)handleDaemonRepairResult:(NSDictionary *)result {
+    self.lastRepairResult = result;
+    NSString *verdict = result[@"repair_result"] ?: @"";
+    NSString *msg;
+    if ([verdict isEqualToString:@"recovered"]) {
+        msg = CLL(@"修复完成：daemon 已在线");
+    } else if ([verdict isEqualToString:@"already_up"]) {
+        msg = CLL(@"daemon 已在运行");
+    } else if ([verdict isEqualToString:@"path_missing"]) {
+        msg = CLL(@"未找到 daemon 二进制，请重装包");
+    } else {
+        NSInteger r = [result[@"root_spawn_rc"] integerValue];
+        NSInteger nr = [result[@"nonroot_spawn_rc"] integerValue];
+        msg = [NSString stringWithFormat:@"%@ root=%@ nonroot=%@",
+               CLL(@"仍不在线（见下方诊断报告）"),
+               CLDiagErrnoLabel(r), CLDiagErrnoLabel(nr)];
+    }
+    if (![result[@"log_tail"] length]) {
+        msg = [msg stringByAppendingString:[NSString stringWithFormat:@"\n%@", CLL(@"日志为空：未进 serve 或不可读")]];
+    }
+    [self presentInfoAlertWithTitle:CLL(@"修复") message:msg];
+    [self refreshEnvironmentDiagnostics];
+}
+
+// 把最近一次修复结果格式化成诊断报告里的「最近修复尝试」段。
+// 含 verdict / spawn rc / 端口前后变化 / launchctl rc，便于离线定位 spawn 失败 vs 端口未开 vs launchctl 失败。
+- (NSString *)repairSummaryTextForResult:(NSDictionary *)result {
+    if (![result isKindOfClass:[NSDictionary class]]) {
+        return @"";
+    }
+    NSString *verdict = result[@"repair_result"] ?: @"";
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    [lines addObject:[NSString stringWithFormat:@"结果: %@", verdict.length ? verdict : @"(未知)"]];
+    [lines addObject:[NSString stringWithFormat:@"初始端口: %@",
+        [result[@"initial_port_open"] boolValue] ? @"YES" : @"NO"]];
+    if (result[@"kill_rc"]) {
+        [lines addObject:[NSString stringWithFormat:@"killall: %@ rc=%@",
+            CLSanitizePathForDiag(result[@"killall_path"]),
+            CLDiagErrnoLabel([result[@"kill_rc"] integerValue])]];
+    }
+    if (result[@"root_spawn_rc"]) {
+        [lines addObject:[NSString stringWithFormat:@"root spawn rc: %@",
+            CLDiagErrnoLabel([result[@"root_spawn_rc"] integerValue])]];
+        [lines addObject:[NSString stringWithFormat:@"root spawn PID: %@",
+            result[@"root_spawn_pid"] ?: @(-1)]];
+    }
+    if (result[@"nonroot_spawn_rc"]) {
+        [lines addObject:[NSString stringWithFormat:@"nonroot spawn rc: %@",
+            CLDiagErrnoLabel([result[@"nonroot_spawn_rc"] integerValue])]];
+        [lines addObject:[NSString stringWithFormat:@"nonroot spawn PID: %@",
+            result[@"nonroot_spawn_pid"] ?: @(-1)]];
+    }
+    if (result[@"port_after_spawn"]) {
+        [lines addObject:[NSString stringWithFormat:@"spawn 后端口: %@",
+            [result[@"port_after_spawn"] boolValue] ? @"YES" : @"NO"]];
+    }
+    if (result[@"child_pid"]) {
+        BOOL childAlive = [result[@"child_alive"] boolValue];
+        NSInteger childExit = [result[@"child_exit_code"] integerValue];
+        NSInteger childSignal = [result[@"child_signal"] integerValue];
+        NSInteger childWaitErrno = [result[@"child_wait_errno"] integerValue];
+        NSInteger childProbeErrno = [result[@"child_probe_errno"] integerValue];
+        NSString *childState = childAlive ? @"alive" :
+            (childExit >= 0 ? [NSString stringWithFormat:@"exited(%ld)", (long)childExit] :
+             (childSignal >= 0 ? [NSString stringWithFormat:@"signaled(%ld)", (long)childSignal] :
+              [NSString stringWithFormat:@"unknown(wait errno=%@ probe errno=%@)",
+               CLDiagErrnoLabel(childWaitErrno), CLDiagErrnoLabel(childProbeErrno)]));
+        [lines addObject:[NSString stringWithFormat:@"子进程 PID:       %@", result[@"child_pid"]]];
+        [lines addObject:[NSString stringWithFormat:@"子进程状态:      %@ wait=%@",
+            childState, result[@"child_wait_status"] ?: @(-1)]];
+        [lines addObject:[NSString stringWithFormat:@"子进程仍存活:    %@",
+            childAlive ? @"YES" : @"NO"]];
+    }
+    if (result[@"launchctl_attempted"]) {
+        if ([result[@"launchctl_attempted"] boolValue]) {
+            [lines addObject:[NSString stringWithFormat:@"launchctl rc: %@",
+                CLDiagErrnoLabel([result[@"launchctl_rc"] integerValue])]];
+            [lines addObject:[NSString stringWithFormat:@"launchctl bootout rc: %@",
+                CLDiagErrnoLabel([result[@"launchctl_bootout_rc"] integerValue])]];
+            NSString *lout = result[@"launchctl_out"];
+            if ([lout isKindOfClass:[NSString class]] && lout.length > 0) {
+                NSString *oneLine = [[lout componentsSeparatedByString:@"\n"]
+                                     componentsJoinedByString:@" ⏎ "];
+                [lines addObject:[NSString stringWithFormat:@"launchctl 输出: %@",
+                    CLRedactJBRootTokens(oneLine)]];
+            }
+        } else {
+            [lines addObject:@"launchctl: 未尝试"];
+        }
+    }
+    if ([result[@"launchctl_print_attempted"] boolValue] && result[@"launchctl_print_rc"]) {
+        [lines addObject:[NSString stringWithFormat:@"launchctl print rc: %@",
+            CLDiagErrnoLabel([result[@"launchctl_print_rc"] integerValue])]];
+        NSString *safePrintOut = CLSanitizeLaunchctlPrintOutput(result[@"launchctl_print_out"]);
+        if (safePrintOut.length > 0) {
+            [lines addObject:[NSString stringWithFormat:@"launchctl print: %@", safePrintOut]];
+        }
+    }
+    if (result[@"launchctl_path"]) {
+        [lines addObject:[NSString stringWithFormat:@"launchctl 命令:   %@ (%@)",
+            CLSanitizePathForDiag(result[@"launchctl_path"]),
+            [result[@"launchctl_exists"] boolValue] ? @"存在" : @"不存在"]];
+    }
+    if (result[@"launchctl_path_candidates"]) {
+        NSArray *launchctlCandidates = [result[@"launchctl_path_candidates"] isKindOfClass:[NSArray class]] ? result[@"launchctl_path_candidates"] : @[];
+        NSMutableArray *safeLaunchctlCandidates = [NSMutableArray array];
+        for (NSString *path in launchctlCandidates) {
+            [safeLaunchctlCandidates addObject:CLSanitizePathForDiag(path)];
+        }
+        [lines addObject:[NSString stringWithFormat:@"launchctl 候选:   %@", safeLaunchctlCandidates.count ? [safeLaunchctlCandidates componentsJoinedByString:@" | "] : @"(无)"]];
+    }
+    if (result[@"plist_candidates"]) {
+        NSArray *plistCandidates = [result[@"plist_candidates"] isKindOfClass:[NSArray class]] ? result[@"plist_candidates"] : @[];
+        NSArray *plistExisting = [result[@"plist_existing"] isKindOfClass:[NSArray class]] ? result[@"plist_existing"] : @[];
+        NSMutableArray *safeCandidates = [NSMutableArray array];
+        for (NSString *path in plistCandidates) {
+            [safeCandidates addObject:CLSanitizePathForDiag(path)];
+        }
+        NSMutableArray *safeExisting = [NSMutableArray array];
+        for (NSString *path in plistExisting) {
+            [safeExisting addObject:CLSanitizePathForDiag(path)];
+        }
+        [lines addObject:[NSString stringWithFormat:@"plist 候选:       %@", safeCandidates.count ? [safeCandidates componentsJoinedByString:@" | "] : @"(无)"]];
+        [lines addObject:[NSString stringWithFormat:@"plist 存在:       %@", safeExisting.count ? [safeExisting componentsJoinedByString:@" | "] : @"(无)"]];
+    }
+    [lines addObject:[NSString stringWithFormat:@"最终端口: %@",
+        [result[@"final_port_open"] boolValue] ? @"YES" : @"NO"]];
+    return [lines componentsJoinedByString:@"\n"];
+}
+
 - (void)updateDiagnosticValues {
     CLBatteryManager *manager = [CLBatteryManager shared];
     NSString *smartChargeCode = [NSString stringWithFormat:@"%ld", (long)manager.smartChargeStatus];
@@ -1640,12 +1971,6 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
     [self addTipRowToCard:scheduleCard text:CLL(@"让设备每隔几天在指定时间暂时解除电量上限；温度控制仍会保留。")];
     [self.mainStack addArrangedSubview:scheduleCard];
 
-    CLAdvSettingsCard *diagnosticsCard = [[CLAdvSettingsCard alloc] init];
-    [diagnosticsCard addSectionHeader:CLL(@"调试与观测")];
-    [diagnosticsCard addPickerRowWithIcon:@"waveform.path.ecg" title:CLL(@"策略诊断") value:CLL(@"查看") color:[UIColor systemTealColor] tag:314 target:self action:@selector(policyDiagnosticsTapped)];
-    [self addTipRowToCard:diagnosticsCard text:CLL(@"集中查看策略切换原因、hold 运行时参数和 Smart Charge 接管状态。")];
-    [self.mainStack addArrangedSubview:diagnosticsCard];
-    
     // 重置按钮
     UIButton *resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
     resetButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1775,11 +2100,6 @@ static const NSInteger CLAdvHoldModeBehaviorTag = 313;
         UIViewController *vc = [[vcClass alloc] init];
         [self.navigationController pushViewController:vc animated:YES];
     }
-}
-
-- (void)policyDiagnosticsTapped {
-    CLPolicyDiagnosticsViewController *vc = [[CLPolicyDiagnosticsViewController alloc] init];
-    [self.navigationController pushViewController:vc animated:YES];
 }
 
 - (void)smartChargeChanged:(UISwitch *)sender {

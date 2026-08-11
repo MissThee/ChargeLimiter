@@ -14,6 +14,9 @@ int main(int argc, char** argv) {
 #else
 
 #include <sqlite3.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <errno.h>
 #import <Foundation/Foundation.h>
 #import <UserNotifications/UserNotifications.h>
 #include <notify.h>
@@ -30,6 +33,9 @@ int main(int argc, char** argv) {
 #endif
 
 #include "utils.h"
+
+extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
+static const unsigned int kCLCSOpsStatus = 0;
 
 #define kHIDPage_PowerDevice                    0x84
 #define kHIDUsage_PD_PeripheralDevice           0x06
@@ -147,6 +153,7 @@ static NSMutableArray<NSNumber*>* g_holdCurrentSamples = nil;
 static BOOL g_predictiveInhibitFallbackActive = NO;
 static BOOL g_chargeControlProbeRunning = NO;
 static NSObject *g_probeLock = nil;
+static NSDictionary* g_lastConfigReloadDiagnostics = nil;
 
 static NSObject *CLProbeGetLock(void) {
     static dispatch_once_t onceToken;
@@ -1283,6 +1290,155 @@ static int getBatInfo(NSDictionary* __strong* pinfo, BOOL slim=YES) {
     return 0;
 }
 
+// 只读诊断:命中 service + 发布 key + 5 个关键 key 存在性 + 库加载。
+// 硬约束:绝不 SetCFProperties / exit / kill / 写文件 / 改 g_use_smart。
+static NSString* CLJBTypeString(void) {
+    switch (getJBType()) {
+        case JBTYPE_ROOTHIDE:   return @"roothide";
+        case JBTYPE_ROOTLESS:   return @"rootless";
+        case JBTYPE_ROOT:       return @"rootful";
+        case JBTYPE_TROLLSTORE: return @"trollstore";
+        default:                return @"unknown";
+    }
+}
+
+static BOOL CLProbeLibJailbreakLoaded(void) {
+    void* h = dlopen("/usr/lib/libjailbreak.dylib", RTLD_LAZY | RTLD_NOLOAD);
+    if (h) {
+        // 已加载则 NOLOAD 成功
+        dlclose(h);
+        return YES;
+    }
+    h = dlopen("/usr/lib/libjailbreak.dylib", RTLD_LAZY);
+    if (h) {
+        dlclose(h);
+        return YES;
+    }
+    return NO;
+}
+
+// roothide 下真实 /usr/lib 通常没有 libjailbreak；失败是预期，勿当故障。
+static NSString* CLLibjailbreakStatusString(BOOL loaded) {
+    if (loaded) {
+        return @"OK";
+    }
+    if (getJBType() == JBTYPE_ROOTHIDE) {
+        return @"N/A(roothide 预期:真实 /usr/lib 无此库)";
+    }
+    return @"❌dlopen失败";
+}
+
+static NSString* CLLibroothideStatusString(void) {
+    if (getJBType() != JBTYPE_ROOTHIDE) {
+        return @"N/A";
+    }
+    // 尝试若干常见路径（只读探测，立即 dlclose）
+    const char* candidates[] = {
+        "/usr/lib/libroothide.dylib",
+        NULL,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        void* h = dlopen(candidates[i], RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) {
+            h = dlopen(candidates[i], RTLD_LAZY);
+        }
+        if (h) {
+            dlclose(h);
+            return @"OK";
+        }
+    }
+    // jbroot 内路径因随机前缀无法穷举；能判定 roothide 即说明运行时路径启发式可用
+    return @"N/A(由 roothide 运行时解析,未在固定路径找到)";
+}
+
+static NSDictionary* getIOPMPSServDiagnostics(void) {
+    NSMutableDictionary* out = [NSMutableDictionary dictionary];
+    out[@"serv_boot"] = @(g_serv_boot);
+    out[@"use_smart"] = @(g_use_smart);
+    out[@"sysver"] = getSysVer() ?: @"";
+    out[@"devmodel"] = getDevMdoel() ?: @"";
+    out[@"ver"] = getAppVer() ?: @"";
+    out[@"jbtype"] = CLJBTypeString();
+
+    BOOL jbLoaded = CLProbeLibJailbreakLoaded();
+    out[@"libjailbreak_loaded"] = @(jbLoaded);
+    out[@"libjailbreak_status"] = CLLibjailbreakStatusString(jbLoaded);
+    out[@"libroothide_status"] = CLLibroothideStatusString();
+
+    // daemon 视角路径（App 侧 dlsym 失败时的权威来源）
+    NSString* exe = getSelfExePath();
+    if (exe.length > 0) {
+        out[@"exe_path"] = exe;
+    }
+    NSString* dataRoot = getRuntimeDataRootPath();
+    if (dataRoot.length > 0) {
+        out[@"data_root"] = dataRoot;
+    }
+
+    NSDictionary* configPersistence = getConfigPersistenceDiagnostics_C();
+    out[@"config_persistence"] = configPersistence ?: @{};
+    out[@"loaded_key_count"] = @(getAllKV().count);
+    out[@"config_reload"] = g_lastConfigReloadDiagnostics ?: @{
+        @"state": @"never",
+        @"reload_ok": @NO,
+        @"loaded_key_count": @0,
+        @"config_path": @"",
+    };
+
+    io_service_t serv = getIOPMPSServ();
+    NSString* serviceName = @"(未匹配)";
+    if (serv != IO_OBJECT_NULL) {
+        serviceName = g_use_smart ? @"AppleSmartBattery" : @"IOPMPowerSource";
+    }
+    out[@"service_name"] = serviceName;
+
+    NSArray* publishedKeys = @[];
+    NSMutableDictionary* keyPresent = [@{
+        @"CurrentCapacity": @NO,
+        @"Amperage": @NO,
+        @"Voltage": @NO,
+        @"IsCharging": @NO,
+        @"Temperature": @NO,
+    } mutableCopy];
+    NSInteger iokitReturn = 0;
+    NSInteger currentCapacity = 0;
+    NSInteger amperage = 0;
+    NSInteger instantAmperage = 0;
+
+    if (serv == IO_OBJECT_NULL) {
+        iokitReturn = -1;
+    } else {
+        CFMutableDictionaryRef props = nil;
+        kern_return_t kr = IORegistryEntryCreateCFProperties(serv, &props, kCFAllocatorDefault, 0);
+        iokitReturn = (NSInteger)kr;
+        if (props == nil) {
+            if (iokitReturn == 0) iokitReturn = -2;
+        } else {
+            NSDictionary* info = (__bridge_transfer NSDictionary*)props;
+            publishedKeys = [[info allKeys] sortedArrayUsingSelector:@selector(compare:)];
+            for (NSString* k in keyPresent.allKeys) {
+                keyPresent[k] = @(info[k] != nil);
+            }
+            if ([info[@"CurrentCapacity"] respondsToSelector:@selector(integerValue)]) {
+                currentCapacity = [info[@"CurrentCapacity"] integerValue];
+            }
+            if ([info[@"Amperage"] respondsToSelector:@selector(integerValue)]) {
+                amperage = [info[@"Amperage"] integerValue];
+            }
+            if ([info[@"InstantAmperage"] respondsToSelector:@selector(integerValue)]) {
+                instantAmperage = [info[@"InstantAmperage"] integerValue];
+            }
+        }
+    }
+    out[@"published_keys"] = publishedKeys;
+    out[@"key_present"] = keyPresent;
+    out[@"iokit_return"] = @(iokitReturn);
+    out[@"current_capacity"] = @(currentCapacity);
+    out[@"amperage"] = @(amperage);
+    out[@"instant_amperage"] = @(instantAmperage);
+    return out;
+}
+
 static int setInflowStatus(BOOL flag) {
     if (g_chargeControlProbeRunning) {
         return 0; // 探针期间忽略自动写
@@ -2120,6 +2276,42 @@ static void notifyForChargeCommandTransition(BOOL previousExternalConnected,
 }
 
 static sqlite3* db = NULL;
+
+// ---------------------------------------------------------------------------
+// sqlite 全局句柄锁：所有对 `db` 的访问必须经由同一把可重入锁串行。
+// 背景：真机崩溃（EXC_BAD_ACCESS，故障地址 0x61746164 == "data"）——
+// http 并发队列的 get_statistics/get_bat_info 读 + battery 事件写 +
+// reload_conf/app_docs 的 uninitDB+initDB 关重开，同时操作同一连接，
+// 其中一个线程释放连接后，另一线程 prepare/step 读到被字符串覆写的悬垂指针。
+// 系统 libsqlite3 为 THREADSAFE=2（multi-thread），同一连接本就不允许跨线程并发。
+// 相关函数如 insertPolicyEventDBData->prune、migrate->insert 等存在互相嵌套调用，
+// 故用 PTHREAD_MUTEX_RECURSIVE；CL_DB_GUARD 借 cleanup 保证任何 return 路径都解锁。
+// ---------------------------------------------------------------------------
+static pthread_mutex_t g_dbMutex;
+static pthread_once_t g_dbMutexOnce = PTHREAD_ONCE_INIT;
+static void clDbMutexInit(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_dbMutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+static void clDbLock(void) {
+    pthread_once(&g_dbMutexOnce, clDbMutexInit);
+    pthread_mutex_lock(&g_dbMutex);
+}
+static void clDbUnlock(void) {
+    pthread_mutex_unlock(&g_dbMutex);
+}
+typedef struct CLDbLockGuard { char _pad; } CLDbLockGuard;
+static void CLDbLockGuardCleanup(CLDbLockGuard* guard) {
+    (void)guard;
+    clDbUnlock();
+}
+#define CL_DB_GUARD()                                                               \
+    CLDbLockGuard cl_db_guard __attribute__((cleanup(CLDbLockGuardCleanup)));       \
+    clDbLock()
+
 static NSSet<NSString*>* allowedStatsTableSuffixes() {
     static NSSet<NSString*>* set = nil;
     static dispatch_once_t onceToken;
@@ -2200,6 +2392,7 @@ static BOOL historyStatsEnabled(void) {
 }
 
 static void updateDBData(NSString* tbl, int tid, NSDictionary* info) {
+    CL_DB_GUARD();
     @autoreleasepool {
         if (!db) {
             return;
@@ -2229,6 +2422,7 @@ static void updateDBData(NSString* tbl, int tid, NSDictionary* info) {
 }
 
 static void prunePolicyEventDBIfNeeded(void) {
+    CL_DB_GUARD(); // insertPolicyEventDBData 嵌套调用，可重入
     if (!db) {
         return;
     }
@@ -2249,6 +2443,7 @@ static void prunePolicyEventDBIfNeeded(void) {
 }
 
 static void insertPolicyEventDBData(NSDictionary* event) {
+    CL_DB_GUARD();
     @autoreleasepool {
         if (!db || ![event isKindOfClass:[NSDictionary class]] || event.count == 0) {
             return;
@@ -2282,6 +2477,7 @@ static void insertPolicyEventDBData(NSDictionary* event) {
 }
 
 static void initDB(NSString* batId) {
+    CL_DB_GUARD();
     @autoreleasepool {
         if (!db) {
             sqlite3* cdb = NULL;
@@ -2327,6 +2523,7 @@ static void initDB(NSString* batId) {
 }
 
 static void uninitDB() {
+    CL_DB_GUARD();
     if (db != NULL) {
         int rc = sqlite3_close(db);
         if (rc != SQLITE_OK) {
@@ -2337,6 +2534,7 @@ static void uninitDB() {
 }
 
 static NSArray* getPolicyEventDBData(int n, int last_id) {
+    CL_DB_GUARD();
     @autoreleasepool {
         if (!db) {
             return @[];
@@ -2390,6 +2588,7 @@ static NSArray* getPolicyEventDBData(int n, int last_id) {
 }
 
 static void migrateStoredPolicyEventsToDBIfNeeded(NSArray* history) {
+    CL_DB_GUARD(); // 内部会调 insertPolicyEventDBData，可重入
     if (!db || ![history isKindOfClass:[NSArray class]] || history.count == 0) {
         return;
     }
@@ -2419,6 +2618,7 @@ static void migrateStoredPolicyEventsToDBIfNeeded(NSArray* history) {
 }
 
 static NSArray* getDBData(NSString* tbl, int n, int last_id) {
+    CL_DB_GUARD();
     @autoreleasepool {
         if (!db) {
             return @[];
@@ -2508,6 +2708,7 @@ static void updateStatistics() {
 }
 
 static void clearStatisticsTablesForBattery(NSString* batId) {
+    CL_DB_GUARD(); // clearAllStatisticsData 内部调用，可重入
     if (!db) {
         return;
     }
@@ -2530,6 +2731,7 @@ static void clearStatisticsTablesForBattery(NSString* batId) {
 }
 
 static void clearAllStatisticsData(void) {
+    CL_DB_GUARD();
     clearStatisticsTablesForBattery(nil);
     NSString* serial = [gUPSPS.props[@"Serial"] isKindOfClass:[NSString class]] ? gUPSPS.props[@"Serial"] : nil;
     if (serial.length > 0) {
@@ -2605,7 +2807,8 @@ static void initConfKeySets() {
             @"adv_hold_behavior",
             @"adv_limit_inflow_mode",
             @"adv_def_thermal_mode",
-            @"full_charge_sched_anchor_date"
+            @"full_charge_sched_anchor_date",
+            @"log_level"
         ]];
     });
 }
@@ -2895,6 +3098,19 @@ static void recoverSmartChargeCoordinationOnBootstrap(void) {
 
 static BOOL policyNeedsSmartChargeCoordination(NSString* policyState) {
     return [@[@"hold", @"hold_recharge", @"stopped", @"temp_paused", @"no_inflow"] containsObject:policyState ?: @""];
+}
+
+static void selfHealSmartChargeOnBootstrap(void) {
+    // 启动自愈：若本地配置已放行(disable_smart_charge=NO)但系统的「优化充电」仍
+    // 处于关闭态（常见于旧版永久停用的残留），自动重新打开，让已卡死的用户
+    // 装新包重启 daemon 后无需任何手动操作即可恢复。
+    BOOL permanentlyDisableSmartCharge = getLocalBool(@"disable_smart_charge", NO);
+    if (permanentlyDisableSmartCharge) {
+        return;
+    }
+    if (!isSmartChargeEnable()) {
+        setSmartChargeEnable(YES);
+    }
 }
 
 static void syncSmartChargeCoordination(NSDictionary* info, BOOL isAdaptorConnected) {
@@ -3268,6 +3484,7 @@ static void initConf(BOOL reset) {
         @"adv_hold_band": @5,
         @"adv_hold_behavior": @"balanced",
         @"adv_hold_temp_disable_smart_charge": @YES,
+        @"disable_smart_charge": @NO, // 清除配置时一并还原系统优化充电开关，避免永久停用残留无法恢复
         @"adv_thermal_avail": @(adv_thermal_avail),
         @"adv_limit_inflow": @NO,
         @"adv_limit_inflow_mode": @"moderate",
@@ -3280,6 +3497,7 @@ static void initConf(BOOL reset) {
         @"full_charge_sched_anchor_date": @"",
         @"full_charge_sched_next_ts": @0,
         @"action": @"",
+        @"log_level": @"normal",
     };
     if (reset) {
         BOOL resetBattery = NO;
@@ -3314,6 +3532,7 @@ static void initConf(BOOL reset) {
             @"update_freq": @1,
             @"lang": @"en",
             @"floatwnd_auto": @NO,
+            @"log_level": @"normal",
         }];
         for (NSString* key in def_mdic) {
             id val = getAllKV()[key];
@@ -3445,6 +3664,12 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
                 }
                 evaluateFullChargeSchedule(YES);
             }
+        } else if ([key isEqualToString:@"disable_smart_charge"]) {
+            // 关闭「永久停用系统优化充电」时，必须把系统优化充电重新打开。
+            // disableSmartCharging: 写的是系统级开关，仅改本地配置不会恢复。
+            if (![val boolValue] && !isSmartChargeEnable()) {
+                setSmartChargeEnable(YES);
+            }
         } else if ([key isEqualToString:@"action"]) {
             if ([val isEqualToString:@"noti"]) {
                 [Service.inst initLocalPush];
@@ -3510,6 +3735,11 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
         };
     } else if ([api isEqualToString:@"reset_conf"]) {
         initConf(YES);
+        // 清除配置后必须把系统的「优化充电」重新打开：永久停用会写系统级开关，
+        // 仅还原本地 disable_smart_charge=NO 无法恢复，需显式 enable。
+        if (!getLocalBool(@"disable_smart_charge", NO) && !isSmartChargeEnable()) {
+            setSmartChargeEnable(YES);
+        }
         tryRestoreSmartChargeAfterCoordination(@"reset_conf");
         refreshFullChargeScheduleTimer(0);
         evaluateFullChargeSchedule(YES);
@@ -3566,12 +3796,25 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
             @"enable": @(g_enable), // for floatwnd
             @"data": data,
         };
+    } else if ([api isEqualToString:@"get_diag"]) {
+        NSDictionary* data = getIOPMPSServDiagnostics();
+        return @{
+            @"status": @0,
+            @"data": data ?: @{},
+        };
     } else if ([api isEqualToString:@"apply_now"]) {
         refreshBatteryStateAndApplyPolicy();
         return @{
             @"status": @0,
         };
     } else if ([api isEqualToString:@"reload_conf"]) {
+        NSString* reloadPath = getConfPath();
+        NSDictionary* diskConfig = reloadPath.length > 0
+            ? [NSDictionary dictionaryWithContentsOfFile:reloadPath]
+            : nil;
+        BOOL reloadOK = [diskConfig isKindOfClass:[NSDictionary class]];
+        NSUInteger loadedKeyCount = reloadOK ? diskConfig.count : 0;
+
         reloadLocalKVFromDisk();
         // Migration may replace db file in-place. Reopen sqlite handle to pick up new file.
         uninitDB();
@@ -3580,8 +3823,23 @@ NSDictionary* handleReq(NSDictionary* nsreq) {
         recoverSmartChargeCoordinationOnBootstrap();
         refreshFullChargeScheduleTimer(0);
         evaluateFullChargeSchedule(YES);
+        NSDictionary* reloadResult = @{
+            @"state": @"reload_conf",
+            @"reload_ok": @(reloadOK),
+            @"loaded_key_count": @(loadedKeyCount),
+            @"config_path": reloadPath ?: @"",
+        };
+        g_lastConfigReloadDiagnostics = reloadResult;
+        if (reloadOK) {
+            NSFileInfoLog(@"config_reload ok=1 key_count=%lu",
+                          (unsigned long)loadedKeyCount);
+        } else {
+            NSFileErrorLog(@"config_reload failed key_count=%lu path=%@",
+                           (unsigned long)loadedKeyCount, reloadPath ?: @"(nil)");
+        }
         return @{
-            @"status": @0,
+            @"status": reloadOK ? @0 : @1,
+            @"data": @{ @"config_reload": reloadResult },
         };
     } else if ([api isEqualToString:@"get_statistics"]) {
         NSDictionary* conf = nsreq[@"conf"];
@@ -4010,12 +4268,17 @@ void detectUPSBattery() {
             @"Port": @(GSERV_PORT),
             @"BindToLocalhost": @YES,
         };
-        BOOL status = [_webServer startWithOptions:options error:nil];
+        NSError *serverError = nil;
+        BOOL status = [_webServer startWithOptions:options error:&serverError];
         if (!status) {
-            NSFileErrorLog(@"%@ serve failed, exit", log_prefix);
+            NSFileErrorLog(@"%@ serve failed, exit startup_stage=gcd_start errno=-1 error=%@ port=%d pid=%d ppid=%d uid=%d euid=%d jbtype=%d",
+                           log_prefix, serverError.localizedDescription ?: @"unknown",
+                           GSERV_PORT, getpid(), getppid(), getuid(), geteuid(), getJBType());
             NSLog(@"%@ serve failed, exit", log_prefix);
             exit(0);
         }
+        NSFileInfoLog(@"%@ listen_ready backend=gcd port=%d",
+                       log_prefix, GSERV_PORT);
 #else
     // 使用自己的简易 HTTP 服务器，替代 GCDWebServers
     static CLSimpleHTTPServer* _webServer = nil;
@@ -4033,11 +4296,27 @@ void detectUPSBattery() {
             }
         }];
         BOOL status = [_webServer startOnPort:GSERV_PORT bindToLocalhost:YES];
+        if (!status && _webServer.failureErrno == EADDRINUSE) {
+            // A stale listener can win the launchd/spawn race. Retry once after
+            // it has had time to close; never widen the localhost exposure.
+            NSFileErrorLog(@"%@ serve retry startup_stage=bind errno=%d error=%@ port=%d pid=%d",
+                           log_prefix, _webServer.failureErrno,
+                           _webServer.failureErrnoMessage ?: @"Address already in use", GSERV_PORT, getpid());
+            usleep(300 * 1000);
+            status = [_webServer startOnPort:GSERV_PORT bindToLocalhost:YES];
+        }
         if (!status) {
-            NSFileErrorLog(@"%@ serve failed, exit", log_prefix);
+            NSFileErrorLog(@"%@ serve failed, exit startup_stage=%@ errno=%d error=%@ port=%d pid=%d ppid=%d uid=%d euid=%d jbtype=%d",
+                           log_prefix,
+                           _webServer.failureStage.length ? _webServer.failureStage : @"unknown",
+                           _webServer.failureErrno,
+                           _webServer.failureErrnoMessage.length ? _webServer.failureErrnoMessage : @"unknown",
+                           GSERV_PORT, getpid(), getppid(), getuid(), geteuid(), getJBType());
             NSLog(@"%@ serve failed, exit", log_prefix);
             exit(0);
         }
+        NSFileInfoLog(@"%@ listen_ready backend=bsd_socket port=%d",
+                       log_prefix, GSERV_PORT);
 #endif
         
         getBatInfo(&bat_info);
@@ -4065,8 +4344,17 @@ void detectUPSBattery() {
         isLPMEnable();
         g_smartChargeStatus = getSmartChargeStatus();
         recoverSmartChargeCoordinationOnBootstrap();
+        selfHealSmartChargeOnBootstrap();
         refreshFullChargeScheduleTimer(0);
         evaluateFullChargeSchedule(YES);
+        NSFileInfoLog(@"%@ daemon_started backend=%@ port=%d",
+                      log_prefix,
+#if CL_USE_GCDWEBSERVER
+                      @"gcd",
+#else
+                      @"bsd_socket",
+#endif
+                      GSERV_PORT);
     }
 }
 @end
@@ -4087,13 +4375,46 @@ int main(int argc, char** argv) { // daemon_main
 
         if (argIndex >= argc) {
             g_serv_boot = (int)time(0);
+            uint32_t entryCSFlags = 0;
+            errno = 0;
+            int entryCSOpsRc = csops(getpid(), kCLCSOpsStatus, &entryCSFlags, sizeof(entryCSFlags));
+            int entryCSOpsErrno = entryCSOpsRc == 0 ? 0 : errno;
+            NSLog2(@"daemon_entry pid=%d ppid=%d uid=%d euid=%d gid=%d egid=%d csops_rc=%d csops_errno=%d csflags=0x%08x jbtype=%d app_docs_override=%d",
+                           getpid(), getppid(), getuid(), geteuid(), getgid(), getegid(),
+                           entryCSOpsRc, entryCSOpsErrno, entryCSFlags,
+                           g_jbtype, argIndex > 1 ? 1 : 0);
+            // 路径解析诊断：记录数据文件落点，不暴露包含 jbroot UUID 的可执行路径。
+            @try {
+                NSString* dLogPath = getLogPath();
+                NSString* dConfPath = getConfPath();
+                NSString* dDbPath = getDbPath();
+                NSString* dDataRoot = getRuntimeDataRootPath();
+                NSLog2(@"daemon_paths log=%@ conf=%@ db=%@ dataRoot=%@",
+                               dLogPath ?: @"(nil)",
+                               dConfPath ?: @"(nil)",
+                               dDbPath ?: @"(nil)",
+                               dDataRoot ?: @"(nil)");
+            } @catch (NSException* e) {
+                NSFileErrorLog(@"daemon_paths EXCEPTION %@", e);
+            }
+            int platformizeRc = -999;
+            int memlimitRc = -999;
+            int launchPlistRepairRc = 0;
             if (g_jbtype == JBTYPE_TROLLSTORE) {
                 signal(SIGHUP, SIG_IGN);
                 signal(SIGTERM, SIG_IGN); // 防止App被Kill以后daemon退出
             } else {
-                platformize_me(); // for jailbreak
-                set_mem_limit(getpid(), 80);
+                platformizeRc = platformize_me(); // for jailbreak
+                memlimitRc = set_mem_limit(getpid(), 80);
             }
+            launchPlistRepairRc = CLRepairRoothideLaunchDaemonPlist();
+            uint32_t privilegeCSFlags = 0;
+            errno = 0;
+            int privilegeCSOpsRc = csops(getpid(), kCLCSOpsStatus, &privilegeCSFlags, sizeof(privilegeCSFlags));
+            int privilegeCSOpsErrno = privilegeCSOpsRc == 0 ? 0 : errno;
+            NSLog2(@"daemon_privilege platformize_rc=%d memlimit_rc=%d launch_plist_repair_rc=%d pid=%d uid=%d euid=%d gid=%d egid=%d csops_rc=%d csops_errno=%d csflags=0x%08x",
+                           platformizeRc, memlimitRc, launchPlistRepairRc, getpid(), getuid(), geteuid(), getgid(), getegid(),
+                           privilegeCSOpsRc, privilegeCSOpsErrno, privilegeCSFlags);
             [Service.inst serve];
             atexit_b(^{
                 if (g_fullChargeScheduleTimer != nil) {

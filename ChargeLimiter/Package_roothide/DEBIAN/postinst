@@ -1,0 +1,71 @@
+#!/bin/sh
+
+APP_DIR="/Applications/ChargeLimiter.app"
+DAEMON_PLIST="/Library/LaunchDaemons/com.chargelimiter.mod.plist"
+CACHE="/var/mobile/Library/Preferences/com.chargelimiter.mod.containerpath"
+
+# 修复共享配置数据目录权限：daemon 以 root 运行时会以 root:wheel 创建文件，
+# 导致 mobile App 无法以原子替换方式写入 com.chargelimiter.mod.plist。
+# 原生 roothide 安装时 maintainer 脚本已在 jbroot 命名空间内，
+# /var/mobile/ChargeLimiter 按 jbroot 逻辑路径书写即可（不要写成 /rootfs/...）。
+DATA_DIR="/var/mobile/ChargeLimiter"
+
+fail_install() {
+    echo "ChargeLimiter postinst: $*" >&2
+    exit 1
+}
+
+repair_shared_data_permissions() {
+    if [ -d "$DATA_DIR" ]; then
+        chown mobile:mobile "$DATA_DIR"
+        chmod 0750 "$DATA_DIR"
+    fi
+    for conf_path in "$DATA_DIR"/com.chargelimiter.mod.plist; do
+        if [ -e "$conf_path" ]; then
+            chown mobile:mobile "$conf_path"
+            chmod 0640 "$conf_path"
+        fi
+    done
+}
+
+chown -R root:wheel "$APP_DIR"
+chmod +s "$APP_DIR/ChargeLimiterDaemon"
+killall -9 ChargeLimiter ChargeLimiterDaemon 2>/dev/null
+rm -f "$CACHE"
+
+# 在 daemon bootstrap 前修复共享数据目录权限，避免 daemon 重新夺走所有权。
+repair_shared_data_permissions
+
+chown root:wheel "$DAEMON_PLIST"
+
+# relaxin: system 域 launchd 在 rootfs 命名空间，看不到 jbroot 内的逻辑路径。
+# 用 jbroot 命令把 Program 解析成 /rootfs/.jbroot-XXX/... 真实路径，
+# 否则 bootstrap 成功但 daemon 永不 exec。
+DAEMON_BIN="$APP_DIR/ChargeLimiterDaemon"
+REAL_DAEMON=""
+command -v jbroot >/dev/null 2>&1 || fail_install "jbroot command is unavailable"
+REAL_DAEMON="$(jbroot "$DAEMON_BIN" 2>/dev/null)" || \
+    fail_install "jbroot failed to resolve $DAEMON_BIN"
+
+case "$REAL_DAEMON" in
+    */.jbroot-*/Applications/ChargeLimiter.app/ChargeLimiterDaemon) ;;
+    *) fail_install "invalid daemon path resolved by jbroot: ${REAL_DAEMON:-<empty>}" ;;
+esac
+[ -x "$REAL_DAEMON" ] || fail_install "resolved daemon is not executable: $REAL_DAEMON"
+
+plutil -replace Program -string "$REAL_DAEMON" "$DAEMON_PLIST" 2>/dev/null || \
+    fail_install "failed to update Program in daemon plist"
+plutil -replace ProgramArguments.0 -string "$REAL_DAEMON" "$DAEMON_PLIST" 2>/dev/null || \
+    fail_install "failed to update ProgramArguments in daemon plist"
+
+# 清理新旧域的可能残留
+launchctl bootout system "$DAEMON_PLIST" 2>/dev/null
+launchctl bootout user/foreground "$DAEMON_PLIST" 2>/dev/null
+if ! launchctl bootstrap system "$DAEMON_PLIST" 2>/dev/null; then
+    launchctl load "$DAEMON_PLIST" 2>/dev/null || \
+        fail_install "launchctl failed to load daemon plist"
+fi
+
+uicache -p "$APP_DIR" 2>/dev/null
+
+exit 0

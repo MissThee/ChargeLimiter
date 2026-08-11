@@ -19,6 +19,12 @@ ChargeLimiter_rootless/Package_tmp
 ChargeLimiter_roothide
 .theos
 out/
+ex/
+
+# Local jailbreak link stubs (filled by Theos vendor / build_packages ensure step; do not commit)
+ChargeLimiter/libroot.a
+ChargeLimiter/libroothide.tbd
+.tmp/
 
 # macOS
 .DS_Store
@@ -48,3 +54,4 @@ AGENTS.md
 .vibeskills
 scripts/tests
 .claude/worktrees/
+.worktrees/

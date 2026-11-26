@@ -19,6 +19,10 @@
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.chargelimiter.daemon.keepalive</string>
+	</array>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleURLTypes</key>
@@ -48,8 +52,19 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>允许后台位置服务以便系统重启后自动拉起充电限流守护进程</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>允许位置服务以便系统重启后自动拉起充电限流守护进程</string>
 	<key>SBAppUsesLocalNotifications</key>
 	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>network-authentication</string>
+		<string>voip</string>
+		<string>location</string>
+		<string>fetch</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

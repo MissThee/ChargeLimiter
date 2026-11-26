@@ -2,27 +2,27 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
   workflow_dispatch:
     inputs:
-      tag:
-        description: "要发布的 tag，例如 v1.12.5"
-        required: true
+      tag_override:
+        description: "可选：指定发布 tag（留空则取项目 MARKETING_VERSION）"
+        required: false
         type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.event.inputs.tag_override || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   build-and-release:
     runs-on: macos-15
     env:
-      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.event.inputs.tag_override || '' }}
       RELEASE_REPO: ${{ github.repository }}
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -271,14 +271,23 @@ jobs:
             echo "[WARN] roothide.h not found; native compile may still succeed if only libroot is required." >&2
           fi
 
-      - name: Verify release tag matches project version
+      - name: Derive release tag from project version
         run: |
+          set -euo pipefail
           PROJECT_VERSION="$(awk -F' = ' '/MARKETING_VERSION =/{gsub(/;/, "", $2); print $2; exit}' ChargeLimiter.xcodeproj/project.pbxproj)"
-          TAG_VERSION="${RELEASE_TAG#v}"
-          if [ "$PROJECT_VERSION" != "$TAG_VERSION" ]; then
-            echo "Tag version ($TAG_VERSION) does not match MARKETING_VERSION ($PROJECT_VERSION)." >&2
+          if [ -z "$PROJECT_VERSION" ]; then
+            echo "Failed to read MARKETING_VERSION from project.pbxproj" >&2
             exit 1
           fi
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            TAG_VERSION="${RELEASE_TAG#v}"
+            if [ "$PROJECT_VERSION" != "$TAG_VERSION" ]; then
+              echo "Override tag ($RELEASE_TAG) does not match MARKETING_VERSION ($PROJECT_VERSION)." >&2
+              exit 1
+            fi
+          fi
+          echo "RELEASE_TAG=v${PROJECT_VERSION}" >> "$GITHUB_ENV"
+          echo "Release tag: v${PROJECT_VERSION}"
 
       - name: Probe build environment
         run: |
@@ -328,6 +337,14 @@ jobs:
             "$TMP/Applications/ChargeLimiter.app/Info.plist" | grep -qx "$TAG_VERSION"
 
           echo "[OK] roothide deb content checks passed for ${TAG_VERSION}"
+
+      - name: Sync release tag to main HEAD
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa "$RELEASE_TAG" -m "Release $RELEASE_TAG"
+          git push -f origin "$RELEASE_TAG"
 
       - name: Generate release notes
         run: |

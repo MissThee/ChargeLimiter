@@ -9,6 +9,7 @@
 #include "ui.h"
 #include "utils.h"
 #import "CLLocalization.h"
+#import <objc/message.h>
 
 // UIKit 原生界面
 #define USE_NATIVE_UIKIT 1
@@ -20,6 +21,7 @@ static int g_jbtype     = -1;
 static int g_wind_type  = 0; // 1: HUD
 
 static void daemonRun(NSArray* nsreq);
+static void registerBGTasks();
 
 static BOOL isDarkMode() {
     if (@available(iOS 13, *)) {
@@ -109,6 +111,12 @@ static AppDelegate* _app = nil;
     }
 
     CLApplyLanguageFromSettings();
+
+    // BGTaskScheduler 保活：必须在 didFinishLaunching 内尽早注册 handler
+    // （Apple 要求在 applicationDidBecomeActive 前完成注册），仅 TrollStore 模式启用。
+    if (g_jbtype == JBTYPE_TROLLSTORE) {
+        registerBGTasks();
+    }
     return YES;
 }
 
@@ -524,18 +532,278 @@ void daemonRun(NSArray* argv) {
     spawn(mArgv, nil, nil, 0, spawnFlags);
 }
 
+// ============================================================
+// TrollStore 自启组件架构 (参考 TrollVNC)
+// 1. NEHotspotHelper       - 系统级后台重拉 (扛重启引擎)
+// 2. WatchDog              - 拉起后保持存活 (定时检查+重启)
+// 3. LaunchAtLogin         - 把App带到前台并解锁
+// 4. SignificantLocation   - 重要位置变化冷启动 (系统重启后位置事件拉起 App)
+// 5. VoIP 后台模式         - Info.plist 声明 voip，系统启动后在后台重启 App
+// 6. BGTaskScheduler       - 后台处理任务周期性保活 (一次性任务完成后重新提交)
+// ============================================================
+
+static void scheduleDaemonRestart() {
+    @autoreleasepool {
+        if (!localPortOpen(GSERV_PORT)) {
+            daemonRun(nil);
+        }
+    }
+}
+
+// --- 组件1: NEHotspotHelper 系统级后台重拉 ---
+// 通过注册NEHotspotHelper, 系统在WiFi事件时会唤醒App,
+// 从而在重启后自动拉起daemon服务
+static void registerHotspotHelper() {
+    @autoreleasepool {
+        NSBundle* netExtBundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/NetworkExtension.framework"];
+        if (!netExtBundle || ![netExtBundle load]) {
+            NSLog(@"[CL-AutoStart] Failed to load NetworkExtension.framework");
+            return;
+        }
+        Class NEHotspotHelperClass = NSClassFromString(@"NEHotspotHelper");
+        if (!NEHotspotHelperClass) {
+            NSLog(@"[CL-AutoStart] NEHotspotHelper class not found");
+            return;
+        }
+        SEL registerSelector = NSSelectorFromString(@"registerWithOptions:queue:handler:");
+        if (![NEHotspotHelperClass respondsToSelector:registerSelector]) {
+            NSLog(@"[CL-AutoStart] NEHotspotHelper does not respond to registerWithOptions:queue:handler:");
+            return;
+        }
+        // 使用字符串字面量, 因为框架是动态加载的, 编译时无法链接kNEHotspotHelperOptionDisplayName常量
+        NSDictionary* options = @{
+            @"DisplayLabel": @"ChargeLimiter"
+        };
+        dispatch_queue_t queue = dispatch_queue_create("ChargeLimiter.HotspotHelper", NULL);
+
+        void (^hotspotHandler)(id) = ^(id cmd) {
+            @autoreleasepool {
+                NSLog(@"[CL-AutoStart] NEHotspotHelper callback triggered, restarting daemon");
+                scheduleDaemonRestart();
+            }
+        };
+
+        BOOL result = ((BOOL(*)(Class, SEL, NSDictionary*, dispatch_queue_t, void(^)(id)))objc_msgSend)(
+            NEHotspotHelperClass, registerSelector, options, queue, hotspotHandler);
+
+        if (result) {
+            NSLog(@"[CL-AutoStart] NEHotspotHelper registered successfully");
+        } else {
+            NSLog(@"[CL-AutoStart] NEHotspotHelper registration failed");
+        }
+    }
+}
+
+// --- 组件3: LaunchAtLogin 前台拉起 ---
+// Darwin通知回调必须使用C函数指针, 不能使用block
+static void systemBootCallback(CFNotificationCenterRef center, void* observer,
+                                CFStringRef name, void const* object, CFDictionaryRef userInfo) {
+    @autoreleasepool {
+        NSLog(@"[CL-AutoStart] System notification received: %@", (__bridge NSString*)name);
+        // 重启daemon
+        scheduleDaemonRestart();
+        // 延迟拉起App到前台 (等待daemon启动完成)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                        dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                // 使用FBSOpenApplication拉起自身到前台
+                Class FBSSystemServiceClass = NSClassFromString(@"FBSSystemService");
+                if (FBSSystemServiceClass) {
+                    id sharedService = [FBSSystemServiceClass performSelector:NSSelectorFromString(@"sharedService")];
+                    if (sharedService) {
+                        NSString* bid = NSBundle.mainBundle.bundleIdentifier;
+                        SEL openSel = NSSelectorFromString(@"openApplication:withOptions:withResult:");
+                        if ([sharedService respondsToSelector:openSel]) {
+                            ((void(*)(id, SEL, NSString*, id, id))objc_msgSend)(
+                                sharedService, openSel, bid, nil, nil);
+                            NSLog(@"[CL-AutoStart] Launched app to foreground via FBSSystemService");
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+static void registerSystemNotifications() {
+    @autoreleasepool {
+        CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
+        // 系统启动完成通知
+        CFNotificationCenterAddObserver(center, NULL, systemBootCallback,
+            CFSTR("com.apple.springboard.systemLaunch"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        // 系统从休眠唤醒通知
+        CFNotificationCenterAddObserver(center, NULL, systemBootCallback,
+            CFSTR("com.apple.system.resumed"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        // 锁屏解锁通知
+        CFNotificationCenterAddObserver(center, NULL, systemBootCallback,
+            CFSTR("com.apple.springboard.lockstate"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        NSLog(@"[CL-AutoStart] System notifications registered");
+    }
+}
+
+// --- 组件4: 重要位置变化冷启动 ---
+// significant-change location service 的注册跨系统重启保留，
+// 位置发生显著变化时系统会把已终止的 App 拉起到后台，
+// 于是 main() 里的 start_daemon() 再次执行，拉起 daemon。
+// 动态加载 CLLocationManager，避免仅为位置服务改动 pbxproj 链接依赖。
+@interface CLAutoStartLocationDelegate : NSObject
+@end
+
+@implementation CLAutoStartLocationDelegate
+// 位置事件回调：首次定位或显著位置变化
+- (void)locationManager:(id)manager didUpdateLocations:(NSArray*)locations {
+    NSLog(@"[CL-AutoStart] Significant location change, restarting daemon");
+    scheduleDaemonRestart();
+}
+- (void)locationManager:(id)manager didFailWithError:(NSError*)error {
+    NSLog(@"[CL-AutoStart] Location manager error: %@", error);
+}
+// CLAuthorizationStatus: 3=WhenInUse, 4=Always（避免 import CoreLocation 引入链接依赖）
+- (void)locationManager:(id)manager didChangeAuthorizationStatus:(NSInteger)status {
+    if (status == 3 || status == 4) {
+        SEL startSel = NSSelectorFromString(@"startMonitoringSignificantLocationChanges");
+        if ([manager respondsToSelector:startSel]) {
+            ((void(*)(id, SEL))objc_msgSend)(manager, startSel);
+            NSLog(@"[CL-AutoStart] Location authorized, significant-change monitoring (re)started");
+        }
+    }
+}
+@end
+
+static CLAutoStartLocationDelegate* g_autoStartLocationDelegate = nil;
+static id g_autoStartLocationManager = nil;
+
+static void registerSignificantLocationChanges() {
+    @autoreleasepool {
+        Class lmClass = NSClassFromString(@"CLLocationManager");
+        if (!lmClass) {
+            NSLog(@"[CL-AutoStart] CLLocationManager not available");
+            return;
+        }
+        g_autoStartLocationManager = [[lmClass alloc] init];
+        g_autoStartLocationDelegate = [CLAutoStartLocationDelegate new];
+        ((void(*)(id, SEL, id))objc_msgSend)(g_autoStartLocationManager,
+            NSSelectorFromString(@"setDelegate:"), g_autoStartLocationDelegate);
+        // significant-change 需要 Always 授权
+        SEL alwaysSel = NSSelectorFromString(@"requestAlwaysAuthorization");
+        if ([g_autoStartLocationManager respondsToSelector:alwaysSel]) {
+            ((void(*)(id, SEL))objc_msgSend)(g_autoStartLocationManager, alwaysSel);
+        }
+        SEL startSel = NSSelectorFromString(@"startMonitoringSignificantLocationChanges");
+        if ([g_autoStartLocationManager respondsToSelector:startSel]) {
+            ((void(*)(id, SEL))objc_msgSend)(g_autoStartLocationManager, startSel);
+            NSLog(@"[CL-AutoStart] Significant location change monitoring registered");
+        }
+    }
+}
+
+// --- 组件6: BGTaskScheduler 后台任务保活 ---
+// 通过 BGAppRefreshTask 周期性唤醒 App，main() 里的 start_daemon()
+// 会重新评估并拉起 daemon，作为 WatchDog 之外的系统级兜底。
+// 动态加载 BackgroundTasks.framework，避免改动 pbxproj 链接依赖。
+static NSString* const kCLBGTaskIdentifier = @"com.chargelimiter.daemon.keepalive";
+
+static void submitBGKeepAliveTask() {
+    @autoreleasepool {
+        Class requestClass = NSClassFromString(@"BGAppRefreshTaskRequest");
+        if (!requestClass) {
+            NSLog(@"[CL-AutoStart] BGAppRefreshTaskRequest class not found");
+            return;
+        }
+        // 动态加载的 framework 没有编译期方法声明，必须用显式签名的 objc_msgSend，
+        // 否则 Xcode 26 的 strict objc_msgSend 检查会报 "no known instance method"。
+        id request = ((id(*)(id, SEL, NSString*))objc_msgSend)(
+            [requestClass alloc], NSSelectorFromString(@"initWithIdentifier:"), kCLBGTaskIdentifier);
+        SEL setDateSel = NSSelectorFromString(@"setEarliestBeginDate:");
+        if ([request respondsToSelector:setDateSel]) {
+            // 系统不保证准时执行，这里只给最早触发时间
+            NSDate* earliest = [NSDate dateWithTimeIntervalSinceNow:15 * 60];
+            ((void(*)(id, SEL, id))objc_msgSend)(request, setDateSel, earliest);
+        }
+        Class schedulerClass = NSClassFromString(@"BGTaskScheduler");
+        id scheduler = ((id(*)(Class, SEL))objc_msgSend)(schedulerClass, NSSelectorFromString(@"sharedScheduler"));
+        NSError* __autoreleasing error = nil;
+        BOOL ok = ((BOOL(*)(id, SEL, id, NSError**))objc_msgSend)(
+            scheduler, NSSelectorFromString(@"submitTaskRequest:error:"), request, &error);
+        NSLog(@"[CL-AutoStart] BG keepalive task submitted=%@ error=%@", ok ? @"YES" : @"NO", error);
+    }
+}
+
+static void registerBGTasks() {
+    @autoreleasepool {
+        NSBundle* bgBundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/BackgroundTasks.framework"];
+        if (!bgBundle || ![bgBundle load]) {
+            NSLog(@"[CL-AutoStart] Failed to load BackgroundTasks.framework");
+            return;
+        }
+        Class schedulerClass = NSClassFromString(@"BGTaskScheduler");
+        if (!schedulerClass) {
+            NSLog(@"[CL-AutoStart] BGTaskScheduler class not found");
+            return;
+        }
+        id scheduler = ((id(*)(Class, SEL))objc_msgSend)(schedulerClass, NSSelectorFromString(@"sharedScheduler"));
+        SEL registerSel = NSSelectorFromString(@"registerTaskWithIdentifier:usingQueue:launchHandler:");
+        if (!scheduler || ![scheduler respondsToSelector:registerSel]) {
+            NSLog(@"[CL-AutoStart] BGTaskScheduler register selector unavailable");
+            return;
+        }
+        // 一次性任务：回调后必须重新提交，并在结束前标记完成
+        BOOL (^launchHandler)(id) = ^BOOL(id task) {
+            @autoreleasepool {
+                NSLog(@"[CL-AutoStart] BG keepalive task fired, restarting daemon");
+                scheduleDaemonRestart();
+                submitBGKeepAliveTask();
+                SEL completeSel = NSSelectorFromString(@"setTaskCompletedWithSuccess:");
+                if ([task respondsToSelector:completeSel]) {
+                    ((void(*)(id, SEL, BOOL))objc_msgSend)(task, completeSel, YES);
+                }
+                return YES;
+            }
+        };
+        BOOL ok = ((BOOL(*)(id, SEL, NSString*, id, id))objc_msgSend)(
+            scheduler, registerSel, kCLBGTaskIdentifier, nil, launchHandler);
+        NSLog(@"[CL-AutoStart] BG task handler registered=%@", ok ? @"YES" : @"NO");
+        if (ok) {
+            submitBGKeepAliveTask();
+        }
+    }
+}
+
+// --- 组件2: WatchDog 保持存活 ---
+// 定时检查daemon端口, 如果不存在则重启
+// 配合daemon端的信号忽略(SIGHUP/SIGTERM/SIG_IGN)确保存活
 static void start_daemon() {
     @autoreleasepool {
         if (g_jbtype == JBTYPE_TROLLSTORE) {
+            NSLog(@"[CL-AutoStart] TrollStore mode: initializing auto-start components");
+
+            // 组件1: NEHotspotHelper - 系统级后台重拉引擎
+            registerHotspotHelper();
+
+            // 组件3: LaunchAtLogin - 注册系统启动/唤醒通知
+            registerSystemNotifications();
+
+            // 组件4: 重要位置变化 - 系统重启后位置变化拉起 App 的冷启动入口
+            // 必须在主线程 RunLoop 起来后调用，授权弹窗与监控注册才可靠。
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @autoreleasepool {
+                    registerSignificantLocationChanges();
+                }
+            });
+
+            // 组件2: WatchDog - 定时检查daemon存活状态
             NSTimer* start_daemon_timer = [NSTimer timerWithTimeInterval:10 repeats:YES block:^(NSTimer* timer) {
                 @autoreleasepool {
-                    if (!localPortOpen(GSERV_PORT)) {
-                        daemonRun(nil);
-                    }
+                    scheduleDaemonRestart();
                 }
             }];
             [start_daemon_timer fire];
             [NSRunLoop.currentRunLoop addTimer:start_daemon_timer forMode:NSDefaultRunLoopMode];
+
+            NSLog(@"[CL-AutoStart] All components initialized: NEHotspotHelper + WatchDog + LaunchAtLogin + SignificantLocation");
         }
     }
 }
